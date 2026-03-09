@@ -35,6 +35,7 @@ let
   val target_line = ${line_ml} : int;
 
   val original = File.read thy_file;
+  val file_lines = String.fields (fn c => c = #"\\n") original;
 
   (* pre-load local imports via Thy_Info so they are available *)
   val master_dir = Path.dir (File.absolute_path thy_file);
@@ -62,7 +63,23 @@ let
       val dominated = (case line_opt of SOME l => l > target_line | NONE => false);
     in
       if dominated then st
-      else Toplevel.command_exception true tr st
+      else
+        Toplevel.command_exception true tr st
+        handle exn =>
+          let
+            val fail_line = (case line_opt of SOME l => l | NONE => 0);
+            val fail_content =
+              if fail_line >= 1 andalso fail_line <= length file_lines
+              then List.nth (file_lines, fail_line - 1) else "";
+          in
+            writeln ${sentinel_start_ml};
+            writeln ("Error at line " ^
+                     Int.toString fail_line ^
+                     " (" ^ fail_content ^ "): " ^
+                     Runtime.exn_message exn);
+            writeln ${sentinel_end_ml};
+            Exn.reraise exn
+          end
     end
   ) transitions (Toplevel.make_state NONE);
 

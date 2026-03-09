@@ -46,6 +46,12 @@ let
   val modified =
     String.substring (original, 0, Int.min (insert_off, String.size original)) ^ injection;
 
+  (* content of the user-supplied line, for error diagnostics *)
+  val line_content =
+    if inject_line >= 1 andalso inject_line <= length file_lines
+    then List.nth (file_lines, inject_line - 1)
+    else "";
+
   (* pre-load local imports via Thy_Info so they are available *)
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
@@ -75,7 +81,24 @@ let
       val is_injection =
         (line_opt = SOME inject_pos_line andalso tr_name = "find_theorems");
       val () = if is_injection then writeln ${sentinel_start_ml} else ();
-      val st' = Toplevel.command_exception true tr st;
+      val st' =
+        Toplevel.command_exception true tr st
+        handle exn =>
+          let
+            val fail_line = (case line_opt of SOME l => l | NONE => 0);
+            val fail_content =
+              if fail_line >= 1 andalso fail_line <= length file_lines
+              then List.nth (file_lines, fail_line - 1) else "";
+          in
+            if not is_injection then writeln ${sentinel_start_ml} else ();
+            writeln (
+              (if is_injection then "Error at line " else "Error before injection at line ") ^
+              Int.toString (if is_injection then inject_line else fail_line) ^
+              " (" ^ (if is_injection then line_content else fail_content) ^ "): " ^
+              Runtime.exn_message exn);
+            writeln ${sentinel_end_ml};
+            Exn.reraise exn
+          end;
       val () = if is_injection then writeln ${sentinel_end_ml} else ();
     in
       if (case line_opt of SOME l => l > inject_pos_line | NONE => false) then st
