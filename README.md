@@ -3,4 +3,6 @@ Repository exposing Isabelle (2025-2) commands to the command line for agentic w
 The repository was created in a week to learn how to do spec-driven development with GenAI agents. 
 It is a proof of concept to support autoformalization workflows like that in [isa_top_autoform1](https://github.com/JUrban/isa_top_autoform1)
 It is not intended to be maintained long-term.
-Currently, the supported tools include `find_theorems`, `sledgehammer`, and a command that prints Isabelle's (jEdit Output panel) proof state to the terminal.
+Previously, there was a specific tool for a specific command, e.g. `find_theorems`, `sledgehammer`, and a command that prints Isabelle's (jEdit Output panel) proof state to the terminal.
+Currently, all previous developments in `legacy` are now subsumed by the `eval_at` tool.
+
