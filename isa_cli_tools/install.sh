@@ -2,20 +2,36 @@
 # install.sh — Install (or upgrade) eval_at and desorry into an existing Isabelle installation.
 #
 # Usage:
-#   bash install.sh /path/to/isabelle
+#   bash install.sh [-f] /path/to/isabelle
+#
+# Options:
+#   -f   Force reinstallation: re-register tools in build.props and
+#        isabelle_tool.scala even if entries already exist (useful if
+#        registrations are corrupted or out of date).
 #
 # The script is idempotent: safe to re-run on an existing installation.
-# Source files are overwritten; build.props and isabelle_tool.scala are only
-# patched if the entries are not already present.
+# Source files are always overwritten. Registration entries in build.props
+# and isabelle_tool.scala are only patched if not already present (unless
+# -f is given).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FORCE=false
+
+while getopts "f" opt; do
+  case "$opt" in
+    f) FORCE=true ;;
+    *) echo "Usage: $0 [-f] /path/to/isabelle" >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
 ISABELLE_HOME="${1:-}"
 
 if [ -z "$ISABELLE_HOME" ]; then
   echo "Error: Isabelle home directory required as first argument." >&2
-  echo "Usage: $0 /path/to/isabelle" >&2
+  echo "Usage: $0 [-f] /path/to/isabelle" >&2
   exit 1
 fi
 
@@ -45,9 +61,11 @@ echo "  -> $ISABELLE_HOME/src/Pure/Tools/desorry.scala"
 echo ""
 echo "Step 3/6: Registering sources in etc/build.props..."
 
-if grep -qF "eval_at.scala" "$BUILD_PROPS"; then
-  echo "  eval_at.scala (already present, skipping)"
+if grep -qF "eval_at.scala" "$BUILD_PROPS" && [ "$FORCE" = false ]; then
+  echo "  eval_at.scala (already present, skipping — use -f to force)"
 else
+  # Remove existing entry first (if any) to avoid duplicates
+  sed -i.bak '/src\/Pure\/Tools\/eval_at\.scala/d' "$BUILD_PROPS"
   sed -i.bak \
     's|  src/Pure/Tools/flarum\.scala \\|  src/Pure/Tools/eval_at.scala \\\n  src/Pure/Tools/flarum.scala \\|' \
     "$BUILD_PROPS"
@@ -59,9 +77,11 @@ else
   fi
 fi
 
-if grep -qF "desorry.scala" "$BUILD_PROPS"; then
-  echo "  desorry.scala (already present, skipping)"
+if grep -qF "desorry.scala" "$BUILD_PROPS" && [ "$FORCE" = false ]; then
+  echo "  desorry.scala (already present, skipping — use -f to force)"
 else
+  # Remove existing entry first (if any) to avoid duplicates
+  sed -i.bak '/src\/Pure\/Tools\/desorry\.scala/d' "$BUILD_PROPS"
   # Insert alphabetically before eval_at.scala
   sed -i.bak \
     's|  src/Pure/Tools/eval_at\.scala \\|  src/Pure/Tools/desorry.scala \\\n  src/Pure/Tools/eval_at.scala \\|' \
@@ -78,9 +98,11 @@ fi
 echo ""
 echo "Step 4/6: Registering tools in isabelle_tool.scala..."
 
-if grep -qF "Eval_At" "$TOOL_SCALA"; then
-  echo "  Eval_At (already present, skipping)"
+if grep -qF "Eval_At" "$TOOL_SCALA" && [ "$FORCE" = false ]; then
+  echo "  Eval_At (already present, skipping — use -f to force)"
 else
+  # Remove existing entry first (if any) to avoid duplicates
+  sed -i.bak '/Eval_At\.isabelle_tool/d' "$TOOL_SCALA"
   sed -i.bak \
     's|  Export\.isabelle_tool,|  Eval_At.isabelle_tool,\n  Export.isabelle_tool,|' \
     "$TOOL_SCALA"
@@ -92,9 +114,11 @@ else
   fi
 fi
 
-if grep -qF "Desorry" "$TOOL_SCALA"; then
-  echo "  Desorry (already present, skipping)"
+if grep -qF "Desorry" "$TOOL_SCALA" && [ "$FORCE" = false ]; then
+  echo "  Desorry (already present, skipping — use -f to force)"
 else
+  # Remove existing entry first (if any) to avoid duplicates
+  sed -i.bak '/Desorry\.isabelle_tool/d' "$TOOL_SCALA"
   # Insert alphabetically before Eval_At.isabelle_tool
   sed -i.bak \
     's|  Eval_At\.isabelle_tool,|  Desorry.isabelle_tool,\n  Eval_At.isabelle_tool,|' \

@@ -434,6 +434,7 @@ end;
         progress.echo("eval_at: line " + line +
           " (" + line_content + "): failed (return code " + result.rc + ")")
         if (result.err.nonEmpty) progress.echo(result.err)
+        if (result.out.nonEmpty) progress.echo(result.out)
       }
       else if (inject_mode) {
         progress.echo("eval_at: line " + line +

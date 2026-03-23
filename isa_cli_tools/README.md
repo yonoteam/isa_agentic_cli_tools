@@ -20,7 +20,7 @@ An Isabelle installation (tested with Isabelle 2025-2).
 isabelle version   # must print a version string
 ```
 
-### Install
+### Automated install
 
 ```bash
 bash install.sh /path/to/isabelle
@@ -29,6 +29,82 @@ bash install.sh /path/to/isabelle
 The installer copies the Scala sources into the Isabelle source tree,
 registers them in `etc/build.props` and `isabelle_tool.scala`, then
 rebuilds (`isabelle scala_build`). It is idempotent — safe to re-run.
+
+To update to newer sources, re-run the same command. The Scala files are
+always overwritten; registration entries are skipped if already present.
+Use `-f` to force re-registration:
+
+```bash
+bash install.sh -f /path/to/isabelle
+```
+
+### Manual install
+
+If you prefer to install by hand (or the installer doesn't work for your
+Isabelle version), follow these four steps. `$ISA` refers to your
+Isabelle installation root (the directory containing `bin/isabelle`).
+
+**Step 1.** Copy the Scala source files:
+
+```bash
+cp src/Pure/Tools/eval_at.scala  $ISA/src/Pure/Tools/
+cp src/Pure/Tools/desorry.scala  $ISA/src/Pure/Tools/
+```
+
+**Step 2.** Register the source files in `$ISA/etc/build.props`.
+Find the alphabetically sorted list of `src/Pure/Tools/*.scala` entries
+and add two lines (maintaining alphabetical order):
+
+```
+  src/Pure/Tools/desorry.scala \
+  src/Pure/Tools/eval_at.scala \
+```
+
+For example, they go right before the `flarum.scala` entry:
+
+```
+  ...
+  src/Pure/Tools/desorry.scala \
+  src/Pure/Tools/eval_at.scala \
+  src/Pure/Tools/flarum.scala \
+  ...
+```
+
+**Step 3.** Register the tools in
+`$ISA/src/Pure/System/isabelle_tool.scala`. Find the alphabetically
+sorted list of `*.isabelle_tool` entries and add two lines:
+
+```scala
+  Desorry.isabelle_tool,
+  Eval_At.isabelle_tool,
+```
+
+For example, they go right before the `Export.isabelle_tool` entry:
+
+```scala
+  ...
+  Desorry.isabelle_tool,
+  Eval_At.isabelle_tool,
+  Export.isabelle_tool,
+  ...
+```
+
+**Step 4.** Rebuild the Scala layer:
+
+```bash
+$ISA/bin/isabelle scala_build
+```
+
+### Manual update (sources already registered)
+
+If the tools were previously installed and you only need to pick up
+source changes, you can skip the registration steps:
+
+```bash
+cp src/Pure/Tools/eval_at.scala  $ISA/src/Pure/Tools/
+cp src/Pure/Tools/desorry.scala  $ISA/src/Pure/Tools/
+$ISA/bin/isabelle scala_build
+```
 
 ### Verify
 
