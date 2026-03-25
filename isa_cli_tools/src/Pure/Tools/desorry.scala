@@ -122,11 +122,12 @@ end;
   /** Phase 1 ML script: transition replay and orchestration (Pure structures only) **/
 
   private def ml_script_phase1(
-    thy_file: Path, stop_line: Int, timeout: Int, phase2_path: Path
+    thy_file: Path, stop_line: Int, timeout: Int, target_lines: List[Int], phase2_path: Path
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val stop_line_ml = ML_Syntax.print_int(stop_line)
     val timeout_ml = ML_Syntax.print_int(timeout)
+    val target_lines_ml = ML_Syntax.print_list(ML_Syntax.print_int)(target_lines)
     val phase2_path_ml = ML_Syntax.print_string_bytes(File.platform_path(phase2_path))
     val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
@@ -145,6 +146,7 @@ let
   val thy_path = ${thy_path_ml};
   val stop_line = ${stop_line_ml} : int;
   val timeout = ${timeout_ml} : int;
+  val target_lines = ${target_lines_ml} : int list;
   val phase2_path = ${phase2_path_ml};
 
 
@@ -197,8 +199,9 @@ let
           if stop_line > 0 andalso tr_line >= stop_line then rev acc
           else if Toplevel.name_of tr = "sorry" then
             let
+              val keep_sorry = null target_lines orelse Library.member (op =) target_lines tr_line
               val sorry_state =
-                if Toplevel.is_proof st
+                if keep_sorry andalso Toplevel.is_proof st
                 then SOME (Toplevel.proof_of st)
                 else NONE
               val st' = execute_transition tr st
@@ -349,6 +352,7 @@ end;
     thy_file: Path,
     stop_line: Int = 0,
     timeout: Int = 30,
+    target_lines: List[Int] = Nil,
     logic: String = "",
     dirs: List[Path] = Nil,
     verbose: Boolean = false,
@@ -415,7 +419,7 @@ end;
       val phase2_path = tmp_dir + Path.explode("desorry_phase2.ML")
       File.write(phase2_path, ml_script_phase2())
 
-      val script_content = ml_script_phase1(thy_file, stop_line, timeout, phase2_path)
+      val script_content = ml_script_phase1(thy_file, stop_line, timeout, target_lines, phase2_path)
       val script_path = tmp_dir + Path.explode("desorry.ML")
       File.write(script_path, script_content)
 
@@ -484,6 +488,7 @@ end;
       var logic = ""
       var options = Options.init()
       var stop_line = 0
+      var target_lines = List.empty[Int]
       var timeout = 30
       var verbose = false
 
@@ -491,6 +496,7 @@ end;
 Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   Options are:
+    -L LINES     comma-separated list of line numbers to target (e.g., 42,105)
     -d DIR       include session directory for import resolution
     -l NAME      logic session name (override automatic derivation)
     -o OPTION    override Isabelle system option
@@ -500,6 +506,7 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
   Process THY_FILE: find all sorry proofs (up to LINE if given),
   run Sledgehammer on each in parallel, and replace sorry's in-place
   with the found proofs.  A backup is saved to THY_FILE.backup.
+  If -L is provided, only sorry proofs at the specified lines are processed.
 
   The logic session is derived automatically from the theory's imports.
   Sibling imports in the same directory are loaded automatically.
@@ -508,8 +515,12 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
     isabelle desorry Foo.thy
     isabelle desorry Foo.thy 42
     isabelle desorry -t 60 Foo.thy
+    isabelle desorry -L 42,105 Foo.thy
     isabelle desorry -l HOL-Analysis Foo.thy
 """,
+        "L:" -> (arg =>
+          try { target_lines = space_explode(',', arg).map(Value.Int.parse) }
+          catch { case ERROR(_) => error("Malformed line numbers in -L option (expected comma-separated integers)") }),
         "d:" -> (arg => dirs += Path.explode(arg)),
         "l:" -> (arg => logic = arg),
         "o:" -> (arg => options = options + arg),
@@ -526,7 +537,7 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
       val progress = new Console_Progress(verbose = verbose)
 
       desorry(options, thy_file, stop_line = line, timeout = timeout,
-        logic = logic, dirs = dirs.toList, verbose = verbose,
-        progress = progress)
+        target_lines = target_lines, logic = logic, dirs = dirs.toList,
+        verbose = verbose, progress = progress)
     })
 }

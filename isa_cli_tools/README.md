@@ -415,6 +415,7 @@ found proofs substituted for the corresponding `sorry`s.
 
 | Option | Description |
 |--------|-------------|
+| `-L LINES` | Comma-separated list of line numbers to target (e.g., `42,105`) |
 | `-d DIR` | Add session directory for import resolution (repeatable) |
 | `-l NAME` | Override automatically derived logic session |
 | `-o OPT` | Override Isabelle system option |
@@ -430,6 +431,9 @@ isabelle desorry Foo.thy
 # Only process sorry's up to line 100
 isabelle desorry Foo.thy 100
 
+# Only process sorry's at specific lines
+isabelle desorry -L 42,105 Foo.thy
+
 # Use a 60-second timeout per sorry
 isabelle desorry -t 60 Foo.thy
 
@@ -440,13 +444,14 @@ isabelle desorry -l HOL-Analysis Foo.thy
 ### How it works
 
 1. **Phase 1 (sequential):** Replays all transitions from the theory
-   header, collecting the proof state at each `sorry` position.
+   header, collecting the proof state at each `sorry` position. If the `-L`
+   flag is used, only `sorry` commands at the specified lines are collected.
 2. **Phase 2 (parallel):** Runs Sledgehammer concurrently on all
    collected proof states.
-3. **Output:** Overwrites `THY_FILE` in-place with each `sorry` replaced
-   by the Sledgehammer-found proof text (e.g. `by simp`,
+3. **Output:** Overwrites `THY_FILE` in-place with each processed `sorry`
+   replaced by the Sledgehammer-found proof text (e.g. `by simp`,
    `by (metis foo bar)`), preserving indentation. Sorry's for which no
-   proof was found are left unchanged.
+   proof was found (or those excluded by `-L`) are left unchanged.
 
 ### Backup mechanism
 
