@@ -6,7 +6,8 @@ Replace sorry proofs in a theory file with Sledgehammer results.
 Uses ML_Process to replay Toplevel transitions, collect proof states at
 each sorry, run Sledgehammer in parallel on all of them, and replace
 sorry's in-place (with atomic rename) after saving a .backup.  Theory loading
-follows the same approach as eval_at: session derivation, heap building,
+follows the same approach as eval_at: session derivation, a heap-availability
+check (the heap is required to be pre-built; it is never built here), and
 sibling import resolution via Thy_Info.use_theories with cwd = thy_dir.
 
 The ML script is split into two phases:
@@ -35,6 +36,28 @@ object Desorry {
 
   private val result_tag = "[RESULT] "
 
+  private val ml_local_protocol_handlers =
+    """
+fun desorry_with_local_protocol_handlers f x =
+  let
+    val old_protocol_message_fn = ! Private_Output.protocol_message_fn;
+
+    fun local_protocol_message props _ =
+      if Properties.get props "function" = SOME "invoke_scala" andalso
+         Properties.get props Markup.nameN = SOME "bibtex_session_entries"
+      then
+        (case Properties.get props Markup.idN of
+          SOME id =>
+            Protocol_Command.run "Scala.result"
+              [Bytes.string id, Bytes.string "1"]
+        | NONE => ())
+      else old_protocol_message_fn props [];
+  in
+    Unsynchronized.setmp Private_Output.protocol_message_fn
+      local_protocol_message f x
+  end;
+"""
+
 
   /** Phase 2 ML script: Sledgehammer invocation (evaluated within theory context) **/
 
@@ -46,11 +69,13 @@ let
 
   (* --- Proof text generation --- *)
 
+  (* used_facts here are the per-method facts taken from a preplay_result,
+     i.e. (Pretty.T * stature) list, so `fst` is already a Pretty.T. *)
   fun replacement_text pref_method used_facts =
     let
       val non_chained = filter_out
         (fn (_, (sc, _)) => sc = ATP_Problem_Generate.Chained) used_facts
-      val fact_pretties = map (Pretty.str o fst) non_chained
+      val fact_pretties = map fst non_chained
       val (indirect, direct) =
         if Sledgehammer_Proof_Methods.is_proof_method_direct pref_method
         then ([], fact_pretties)
@@ -64,24 +89,75 @@ let
           "by " "" direct pref_method
     in using_text ^ content_of_pretty method_pretty end;
 
+  fun is_smt_method (Sledgehammer_Proof_Methods.SMT_Method _) = true
+    | is_smt_method _ = false;
+
+  fun self_verified_replacement result state =
+    let
+      val ctxt = Proof.context_of state
+      val {goal, facts = chained, ...} = Proof.goal state
+      val {used_facts, used_from, preferred_methss, ...} = result
+      val used_thm_facts =
+        Sledgehammer_Prover.filter_used_facts false used_facts used_from
+      val global_facts = map snd used_thm_facts
+      val pretty_used_facts =
+        map (fn ((name, stature), _) => (Pretty.str name, stature)) used_thm_facts
+      val method_candidates =
+        fst preferred_methss :: flat (snd preferred_methss)
+        |> filter_out is_smt_method
+        |> distinct (op =)
+
+      fun closes_goal meth =
+        let
+          val tac = Sledgehammer_Proof_Methods.tac_of_proof_method ctxt
+            (chained, global_facts) meth 1
+        in
+          (case Seq.pull (tac goal) of
+            SOME (goal', _) => Thm.nprems_of goal' = 0
+          | NONE => false)
+        end
+        handle ERROR _ => false
+             | THM _ => false
+             | TERM _ => false
+             | CTERM _ => false
+             | TYPE _ => false;
+
+      fun first_verified [] = NONE
+        | first_verified (meth :: meths) =
+            if closes_goal meth then SOME (replacement_text meth pretty_used_facts)
+            else first_verified meths
+    in
+      first_verified method_candidates
+    end;
+
 
   (* --- Sledgehammer invocation --- *)
 
   fun try_sledgehammer timeout state =
     let
       val thy = Proof.theory_of state
+      (* smt_proofs = false: SMT solvers may still be used to *find* a proof,
+         but Sledgehammer reconstructs with structured/metis methods rather
+         than emitting a fragile `by (smt ...)` call.  If no non-smt method
+         preplays, the sorry is left in place (reported as "no proof found"). *)
       val params = Sledgehammer_Commands.default_params thy
-        [("timeout", Int.toString timeout)]
+        [("timeout", Int.toString timeout), ("smt_proofs", "false")]
       val (found, (outcome, _)) =
         Sledgehammer.run_sledgehammer params Sledgehammer_Prover.Normal
           NONE 1 Sledgehammer_Fact.no_fact_override state
     in
       case (found, outcome) of
-        (true, Sledgehammer.SH_Some (result, _)) =>
-          let
-            val (pref_method, _) = #preferred_methss result
-            val used_facts = #used_facts result
-          in SOME (replacement_text pref_method used_facts) end
+        (true, Sledgehammer.SH_Some (result, preplay_results)) =>
+          (* preplay_results is sorted best-first.  Accept a reconstruction
+             only if its preplay actually succeeded (Played); otherwise leave
+             the sorry in place.  Using #preferred_methss instead would take
+             the prover's *unverified* suggestion, which (with smt_proofs =
+             false) can be a metis call whose preplay failed and that then
+             breaks on reload --- the bug this guards against. *)
+          (case preplay_results of
+            (meth, (Sledgehammer_Proof_Methods.Played _, facts)) :: _ =>
+              SOME (replacement_text meth facts)
+          | _ => self_verified_replacement result state)
       | _ => NONE
     end;
 
@@ -133,6 +209,8 @@ end;
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
+${ml_local_protocol_handlers}
+
 (* Communication structure — defined at global level (no context),
    so it goes into the Poly/ML global namespace and is accessible
    from both Phase 1 (top-level) and Phase 2 (theory context). *)
@@ -154,7 +232,7 @@ let
 
   fun execute_transition tr st =
     (case Exn.result
-        (fn () => Toplevel.command_exception true tr st) () of
+        (fn () => Toplevel.command_exception tr st) () of
       Exn.Res st' => st'
     | Exn.Exn exn =>
         let val l = (case Position.line_of (Toplevel.pos_of tr) of
@@ -169,12 +247,13 @@ let
   val original = File.read thy_file;
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default ();
+  val options = Options.default [];
 
-  val _ = List.app (fn (imp, _) =>
-    if Thy_Info.defined_theory imp then ()
-    else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
-  ) (#imports header);
+  val _ = desorry_with_local_protocol_handlers (fn () =>
+    List.app (fn (imp, _) =>
+      if Thy_Info.defined_theory imp then ()
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
+    ) (#imports header)) ();
 
   fun mk_thy () =
     let val parents = map (fn (imp, _) => Thy_Info.get_theory imp)
@@ -345,6 +424,36 @@ end;
   }
 
 
+  /** check logic session without building heaps **/
+
+  private def check_logic_heap(
+    options: Options,
+    logic: String,
+    dirs: List[Path],
+    progress: Progress
+  ): Unit = {
+    val results =
+      Build.build(options,
+        selection = Sessions.Selection.session(logic),
+        progress = progress,
+        build_heap = true,
+        no_build = true,
+        dirs = dirs)
+
+    if (!results.ok) {
+      error("Session heap for " + quote(logic) + " is not available or not up to date; " +
+        "refusing to build it automatically.\n\n" +
+        "How to run this safely:\n" +
+        "  1. Choose a session whose heap is already built.\n" +
+        "  2. If the theory belongs to an unbuilt session, use that session's built parent " +
+        "with -l and pass -d for the directory containing the ROOT file.\n" +
+        "  3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]\n\n" +
+        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
+        "  isabelle desorry -l HOL-Computational_Algebra -d $ISABELLE_HOME/src/HOL FILE.thy")
+    }
+  }
+
+
   /** desorry **/
 
   def desorry(
@@ -362,7 +471,7 @@ end;
     /* read theory content */
 
     val content = File.read(thy_file)
-    val file_lines = content.split("\n", -1)
+    val file_lines = split_lines(content)
 
     Thy_Header.get_thy_name(thy_file.base.implode)
       .getOrElse(error(
@@ -406,10 +515,9 @@ end;
     progress.echo_if(verbose, "Logic session: " + effective_logic)
 
 
-    /* ensure logic heap is available */
+    /* ensure logic heap is available without building */
 
-    Build.build_logic(options, effective_logic, dirs = all_dirs,
-      progress = progress, build_heap = true, strict = true)
+    check_logic_heap(options, effective_logic, all_dirs, progress)
 
 
     /* run the ML scripts via ML_Process */
@@ -423,7 +531,7 @@ end;
       val script_path = tmp_dir + Path.explode("desorry.ML")
       File.write(script_path, script_content)
 
-      val server = Bash.Server.start()
+      val server = Bash.Server.start(Logger.none)
 
       val store = Store(options)
       val qd_options = options + "quick_and_dirty" +
@@ -436,7 +544,7 @@ end;
         store.session_heaps(session_background,
           logic = effective_logic)
 
-      val process =
+      val (_, process) =
         ML_Process(qd_options, session_background, session_heaps,
           args = List("--use", File.platform_path(script_path)),
           cwd = thy_dir,

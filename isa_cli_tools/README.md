@@ -5,8 +5,10 @@ Two command-line tools for Isabelle that work without jEdit or PIDE:
 - **`isabelle eval_at`** — evaluate any Isabelle command at a given theory line
 - **`isabelle desorry`** — replace `sorry` proofs with Sledgehammer results
 
-Both tools auto-detect the logic session, build the heap if needed, and
-handle sibling imports automatically.
+Both tools auto-detect the logic session and handle sibling imports
+automatically. They require the chosen logic's session heap to be **already
+built**, and verify this before doing any work (see
+[Sessions](#sessions-how-the-tools-find-the-right-logic)).
 
 ---
 
@@ -210,22 +212,42 @@ sessions. Use it when:
    isabelle eval_at -d /project/sessions -d /path/to/afp/thys/Foo MyWork.thy 10
    ```
 
-### First run builds the heap
+### The session heap must already be built
 
-The first time a tool runs with a given session (e.g., HOL), it builds the
-session heap. **This can take minutes** (HOL alone takes 5-15 minutes depending
-on hardware). Subsequent runs reuse the cached heap and start in seconds.
+The tools **do not build session heaps.** Before processing a theory, each
+tool verifies that the chosen logic's heap is built and up to date. If it is
+not, the tool stops immediately with an actionable error instead of launching
+a (potentially multi-hour) compile:
 
 ```bash
-# First run: builds HOL heap (slow)
-isabelle eval_at MyTheory.thy 10
+isabelle eval_at -l HOL-Algebra MyTheory.thy 10
+#> *** Session heap for "HOL-Algebra" is not available or not up to date;
+#> *** refusing to build it automatically.
+#> *** How to run this safely:
+#> ***   1. Choose a session whose heap is already built.
+#> ***   2. If the theory belongs to an unbuilt session, use that session's
+#> ***      built parent with -l and pass -d for the directory containing the ROOT.
+#> ***   3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]
+```
 
-# Second run: reuses heap (fast)
+This is deliberate: a runaway background compile is the main hazard in an
+unattended/agent workflow. Build the heap yourself, once, as an explicit
+setup step, then query against it:
+
+```bash
+# One-time setup: build the heap (slow — minutes for HOL, longer for others)
+isabelle build -b HOL
+
+# Thereafter every run reuses the cached heap and starts in seconds
+isabelle eval_at MyTheory.thy 10
 isabelle eval_at MyTheory.thy 20
 ```
 
-Heaps are stored in `~/.isabelle/heaps/`. If you delete them or change Isabelle
-versions, Isabelle rebuilds them automatically.
+Heaps live under `$ISABELLE_HEAPS/polyml-*/` (typically
+`~/.isabelle/<identifier>/heaps/...` for a release, or `~/.isabelle/heaps/...`
+for an unversioned repository build). List the built ones to see what is
+already available — each filename is a built session
+(`isabelle getenv ISABELLE_HEAPS` prints the exact directory).
 
 ### Session examples from the Isabelle distribution
 
@@ -249,6 +271,78 @@ theory MyMeasure imports "HOL-Analysis.Analysis" begin ... end
 
 For each of these, the tools derive the correct session automatically from the
 qualified import names.
+
+### Agent preflight: choosing the logic session
+
+**Read this before scripting `eval_at`/`desorry` (especially from an AI agent).**
+
+Before doing anything else, both tools check that the chosen logic's heap is
+built and up to date. If it is not, they **stop with an error** rather than
+building it (a custom session can take hours to compile). The single most
+important rule is therefore: *make `-l` point at a session whose heap already
+exists.* Pick an unbuilt session and the tool refuses — so choosing the right
+session is on you, the caller.
+
+Preflight checklist:
+
+1. **Read the theory's `imports` line and the local `ROOT`.** Identify which
+   session the theory belongs to (the `theories` clause of a `session` entry)
+   and what it actually depends on. A theory that only imports siblings +
+   `HOL-Analysis.Analysis` only needs `HOL-Analysis` in scope, regardless of
+   how big its own session is.
+
+2. **Check what is already built — never assume.**
+   - List built heaps:
+     `ls "$(isabelle getenv -b ISABELLE_HEAPS)"/polyml-*/`
+     (each filename is a built session; the directory is
+     `~/.isabelle/<identifier>/heaps/...` for a release such as Isabelle2025,
+     or `~/.isabelle/heaps/...` for an unversioned repository build). Names of the form
+     `Foo_requirements(Bar)` are **requirement images** produced by
+     `isabelle build -R Foo` / `isabelle jedit -R Foo` — they contain Foo's
+     *ancestry*, **not** Foo's own theories.
+   - Dry-run a session: `isabelle build -n SESSION` (add `-d DIR` if the
+     session is defined by a local ROOT). If it lists nothing to build, the
+     heap is up to date.
+   - Check session resolvability: `isabelle sessions [-d DIR] SESSION`.
+
+3. **Choose `-l` deliberately:**
+   - If the theory's *own* session heap is built, use it.
+   - If only a **requirements image** is built (the common case after
+     `isabelle jedit -d DIR -R SESSION`), the session's own theories are *not*
+     in any heap. Pass the **parent session** instead — the `PARENT` in
+     `session SESSION = "PARENT" + ...` in the ROOT — provided its heap is
+     built and contains the needed ancestry. The tool then replays the target
+     theory *and its siblings* from source on top of that heap.
+   - **Prefer a session whose heap is already built.** Passing
+     `-l <unbuilt session>` is not catastrophic — the tool refuses up front
+     rather than building — but it just wastes a round-trip, so aim to get it
+     right the first time.
+
+4. **Pass `-d DIR`** (the directory containing the ROOT) so sibling and
+   bare-name imports resolve. It is best to set `-l` explicitly as well: with
+   `-d` and **no** `-l`, automatic derivation may map a bare sibling import to
+   its member session — which may be the *unbuilt* one — and the tool then
+   refuses, costing you a round-trip.
+
+Worked example. A theory belongs to a local session `My_Session` whose own
+heap has **not** been built — only a requirements image exists (e.g. from
+`isabelle jedit -d . -R My_Session`). The ROOT declares
+`session My_Session = "Parent_Session" + ...`, and `Parent_Session` is built
+and already contains everything the theory imports. Then:
+
+```bash
+# Correct: reuses the built parent heap, replays the theory + siblings from
+# source on top, and builds nothing.
+isabelle eval_at -l Parent_Session -d . My_Theory.thy 15
+
+# Refused: My_Session's heap is not built -> the tool stops with an error
+# (it does not compile). You then re-run with the parent session as above.
+isabelle eval_at -l My_Session -d . My_Theory.thy 15
+
+# Also refused: no -l -> derivation may pick the unbuilt member session,
+# and the tool stops with the same error. Set -l to avoid the round-trip.
+isabelle eval_at -d . My_Theory.thy 15
+```
 
 ---
 
@@ -332,7 +426,7 @@ isabelle eval_at MyTheory.thy 15 'nitpick'
 | `-o OPTION` | Override an Isabelle system option |
 | `-s` | Show proof state after command output (for injection mode) |
 | `-t` | Report timing for each processed line |
-| `-v` | Verbose: show derived session, build progress, ML errors |
+| `-v` | Verbose: show derived session, heap-check progress, ML errors |
 
 Options must come before positional arguments.
 
@@ -505,10 +599,13 @@ resulting proof state. This is normal for `apply`, `by`, `rule`, etc.
 A theory command before LINE failed. Fix the theory file at the indicated
 line, or choose an earlier LINE.
 
-**Very slow first run**
-The session heap is being built. This is a one-time cost per session.
-Subsequent runs reuse the cached heap. Building HOL takes 5-15 minutes;
-HOL-Analysis can take 30+ minutes.
+**"Session heap for ... is not available or not up to date; refusing to build it automatically"**
+The chosen logic's heap is not built. The tools never build heaps. Either
+pick a session whose heap is already built (`-l`), or build the needed heap
+yourself first with `isabelle build -b SESSION [-d ROOT_DIR]`. See
+[Sessions](#sessions-how-the-tools-find-the-right-logic). Building HOL takes
+5-15 minutes; HOL-Analysis can take 30+ minutes — which is exactly why the
+tools leave that decision to you.
 
 **Sledgehammer finds nothing**
 Try: longer timeout (`-t 60` for desorry, or

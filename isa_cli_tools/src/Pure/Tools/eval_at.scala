@@ -23,6 +23,28 @@ object Eval_At {
   private val sentinel_start = "===EVAL_AT_BEGIN==="
   private val sentinel_end   = "===EVAL_AT_END==="
 
+  private val ml_local_protocol_handlers =
+    """
+fun eval_at_with_local_protocol_handlers f x =
+  let
+    val old_protocol_message_fn = ! Private_Output.protocol_message_fn;
+
+    fun local_protocol_message props _ =
+      if Properties.get props "function" = SOME "invoke_scala" andalso
+         Properties.get props Markup.nameN = SOME "bibtex_session_entries"
+      then
+        (case Properties.get props Markup.idN of
+          SOME id =>
+            Protocol_Command.run "Scala.result"
+              [Bytes.string id, Bytes.string "1"]
+        | NONE => ())
+      else old_protocol_message_fn props [];
+  in
+    Unsynchronized.setmp Private_Output.protocol_message_fn
+      local_protocol_message f x
+  end;
+"""
+
 
   /** generate ML script: state mode (no command injection) **/
 
@@ -34,6 +56,8 @@ object Eval_At {
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
+${ml_local_protocol_handlers}
+
 let
   val thy_file    = Path.explode ${thy_path_ml};
   val target_line = ${line_ml} : int;
@@ -45,11 +69,12 @@ let
   (* pre-load local imports via Thy_Info so they are available *)
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default ();
-  val _ = List.app (fn (imp, _) =>
-    if Thy_Info.defined_theory imp then ()
-    else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
-  ) (#imports header);
+  val options = Options.default [];
+  val _ = eval_at_with_local_protocol_handlers (fn () =>
+    List.app (fn (imp, _) =>
+      if Thy_Info.defined_theory imp then ()
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
+    ) (#imports header)) ();
 
   (* init function: resolve imports from Thy_Info, create theory via Resources *)
   val init = fn () =>
@@ -79,7 +104,7 @@ let
   fun exec_timing tr st =
     let
       val start = Timing.start ();
-      val res = Toplevel.command_exception true tr st;
+      val res = Toplevel.command_exception tr st;
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -158,6 +183,8 @@ end;
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
+${ml_local_protocol_handlers}
+
 let
   val thy_file    = Path.explode ${thy_path_ml};
   val inject_line = ${line_ml} : int;
@@ -184,11 +211,12 @@ let
   (* pre-load local imports via Thy_Info so they are available *)
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default ();
-  val _ = List.app (fn (imp, _) =>
-    if Thy_Info.defined_theory imp then ()
-    else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
-  ) (#imports header);
+  val options = Options.default [];
+  val _ = eval_at_with_local_protocol_handlers (fn () =>
+    List.app (fn (imp, _) =>
+      if Thy_Info.defined_theory imp then ()
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
+    ) (#imports header)) ();
 
   (* init function: resolve imports from Thy_Info, create theory via Resources *)
   val init = fn () =>
@@ -217,7 +245,7 @@ let
   fun exec_timing tr st =
     let
       val start = Timing.start ();
-      val res = Toplevel.command_exception true tr st;
+      val res = Toplevel.command_exception tr st;
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -314,6 +342,36 @@ end;
   }
 
 
+  /** check logic session without building heaps **/
+
+  private def check_logic_heap(
+    options: Options,
+    logic: String,
+    dirs: List[Path],
+    progress: Progress
+  ): Unit = {
+    val results =
+      Build.build(options,
+        selection = Sessions.Selection.session(logic),
+        progress = progress,
+        build_heap = true,
+        no_build = true,
+        dirs = dirs)
+
+    if (!results.ok) {
+      error("Session heap for " + quote(logic) + " is not available or not up to date; " +
+        "refusing to build it automatically.\n\n" +
+        "How to run this safely:\n" +
+        "  1. Choose a session whose heap is already built.\n" +
+        "  2. If the theory belongs to an unbuilt session, use that session's built parent " +
+        "with -l and pass -d for the directory containing the ROOT file.\n" +
+        "  3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]\n\n" +
+        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
+        "  isabelle eval_at -l HOL-Computational_Algebra -d $ISABELLE_HOME/src/HOL FILE.thy LINE")
+    }
+  }
+
+
   /** eval_at **/
 
   def eval_at(
@@ -333,7 +391,7 @@ end;
     /* read theory content */
 
     val content = File.read(thy_file)
-    val file_lines = content.split("\n", -1)
+    val file_lines = split_lines(content)
 
     if (line < 1 || line > file_lines.length)
       error("Line " + line + " out of range (file has " + file_lines.length + " lines)")
@@ -377,10 +435,9 @@ end;
     progress.echo_if(verbose, "Logic session: " + effective_logic)
 
 
-    /* ensure logic heap is available */
+    /* ensure logic heap is available without building */
 
-    Build.build_logic(options, effective_logic, dirs = all_dirs, progress = progress,
-      build_heap = true, strict = true)
+    check_logic_heap(options, effective_logic, all_dirs, progress)
 
 
     /* run the ML script via ML_Process */
@@ -395,7 +452,7 @@ end;
       File.write(script_path, script_content)
 
       /* start bash_process server for external tool invocation */
-      val server = Bash.Server.start()
+      val server = Bash.Server.start(Logger.none)
 
       val store = Store(options)
       val qd_options = options + "quick_and_dirty" +
@@ -406,7 +463,7 @@ end;
       val session_heaps =
         store.session_heaps(session_background, logic = effective_logic)
 
-      val process =
+      val (_, process) =
         ML_Process(qd_options, session_background, session_heaps,
           args = List("--use", File.platform_path(script_path)),
           cwd = thy_dir,
@@ -477,7 +534,7 @@ Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
     -o OPTION    override Isabelle system option
     -s           show proof state after command execution
     -t           report timing for each processed line
-    -v           verbose: show derived logic session, build progress,
+    -v           verbose: show derived logic session, heap-check progress,
                  and ML process errors
 
   Evaluate a command at LINE in THY_FILE and print its output.
