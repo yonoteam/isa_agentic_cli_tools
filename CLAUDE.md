@@ -174,7 +174,7 @@ DEV=/Users/jonathan/Programs/repos/isa_cli_tools/isabelle_dev
 # eval_at: proof state at a line (Main theory -> derives/uses HOL)
 "$DEV/bin/isabelle" eval_at tst/Thy_Tests/test6/Scratch.thy 8
 
-# eval_at: inject a command; -T reports per-line timing; -S shows sorts+types
+# eval_at: inject a command
 "$DEV/bin/isabelle" eval_at tst/Thy_Tests/test6/Scratch.thy 5 'thm conjI'
 
 # desorry: copy a fixture into agents/temp first (filename must match theory)

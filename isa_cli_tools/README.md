@@ -481,7 +481,7 @@ When a command exceeds `-t`:
 
 - **`eval_at`** aborts and prints the offending line, e.g.:
   ```
-  eval_at: timed out after 60s at line 42 (apply (induct n)); aborting
+  eval_at: timed out after 60s at line 42 (apply (induct n)).
   ```
   In injection mode the injected command and its line are reported.
 
