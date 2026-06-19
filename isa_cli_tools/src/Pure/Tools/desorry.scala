@@ -36,6 +36,10 @@ object Desorry {
 
   private val result_tag = "[RESULT] "
 
+  /** Sledgehammer timeout per sorry (seconds), fixed **/
+
+  private val sledgehammer_timeout = 50
+
   private val ml_local_protocol_handlers =
     """
 fun desorry_with_local_protocol_handlers f x =
@@ -198,11 +202,13 @@ end;
   /** Phase 1 ML script: transition replay and orchestration (Pure structures only) **/
 
   private def ml_script_phase1(
-    thy_file: Path, stop_line: Int, timeout: Int, target_lines: List[Int], phase2_path: Path
+    thy_file: Path, stop_line: Int, sledge_timeout: Int, cmd_timeout: Int,
+    target_lines: List[Int], phase2_path: Path
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val stop_line_ml = ML_Syntax.print_int(stop_line)
-    val timeout_ml = ML_Syntax.print_int(timeout)
+    val sledge_timeout_ml = ML_Syntax.print_int(sledge_timeout)
+    val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
     val target_lines_ml = ML_Syntax.print_list(ML_Syntax.print_int)(target_lines)
     val phase2_path_ml = ML_Syntax.print_string_bytes(File.platform_path(phase2_path))
     val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
@@ -211,40 +217,44 @@ end;
     s"""
 ${ml_local_protocol_handlers}
 
-(* Communication structure — defined at global level (no context),
-   so it goes into the Poly/ML global namespace and is accessible
-   from both Phase 1 (top-level) and Phase 2 (theory context). *)
 structure Desorry_Comm = struct
   val sorry_states : (int * Proof.state) list Unsynchronized.ref = Unsynchronized.ref [];
-  val timeout : int Unsynchronized.ref = Unsynchronized.ref 30;
+  val timeout : int Unsynchronized.ref = Unsynchronized.ref 50;
   val replacements : (int * string) list Unsynchronized.ref = Unsynchronized.ref [];
 end;
+
+exception Desorry_Timeout of int * string;
 
 let
   val thy_path = ${thy_path_ml};
   val stop_line = ${stop_line_ml} : int;
-  val timeout = ${timeout_ml} : int;
+  val sledge_timeout = ${sledge_timeout_ml} : int;
+  val cmd_timeout = ${cmd_timeout_ml} : int;
   val target_lines = ${target_lines_ml} : int list;
   val phase2_path = ${phase2_path_ml};
 
-
-  (* --- Transition execution (Pure only) --- *)
-
-  fun execute_transition tr st =
-    (case Exn.result
-        (fn () => Toplevel.command_exception tr st) () of
-      Exn.Res st' => st'
-    | Exn.Exn exn =>
-        let val l = (case Position.line_of (Toplevel.pos_of tr) of
-                       SOME l => Int.toString l | NONE => "?")
-        in warning ("desorry: error at line " ^ l ^ ": " ^
-                    Runtime.exn_message exn); st end);
-
-
-  (* --- Load imports and create theory --- *)
-
   val thy_file = Path.explode thy_path;
   val original = File.read thy_file;
+  val file_lines = String.fields (fn c => c = #"\\n") original;
+
+  fun line_content line =
+    if line >= 1 andalso line <= length file_lines
+    then List.nth (file_lines, line - 1) else "";
+
+  fun execute_transition tr st =
+    let
+      val line = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
+    in
+      (case Exn.result (fn () =>
+          Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+            (fn () => Toplevel.command_exception tr st) ()) () of
+        Exn.Res st' => st'
+      | Exn.Exn (Timeout.TIMEOUT _) => raise Desorry_Timeout (line, line_content line)
+      | Exn.Exn exn =>
+          (warning ("desorry: error at line " ^ Int.toString line ^ ": " ^
+                    Runtime.exn_message exn); st))
+    end;
+
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
   val options = Options.default [];
@@ -261,9 +271,6 @@ let
     in Resources.begin_theory master_dir header parents end;
 
   val init_thy = mk_thy ();
-
-
-  (* --- Replay transitions, collect proof states at sorry positions --- *)
 
   val pos = Position.file (Path.implode thy_file);
   val transitions =
@@ -294,12 +301,6 @@ let
             process rest (execute_transition tr st) acc
         end;
 
-  val sorry_states = process transitions (Toplevel.make_state NONE) [];
-  val n_total = length sorry_states;
-
-
-  (* --- Apply replacements to file content (Pure string operations) --- *)
-
   type replacement = {line: int, text: string};
 
   fun apply_replacements original (replacements : replacement list) =
@@ -320,58 +321,52 @@ let
       |> String.concatWith "\\n"
     end;
 
-
-  (* === Main logic === *)
-
   val () = writeln ${sentinel_start_ml};
   val () =
-    if n_total = 0 then
-      writeln "[RESULT] no sorry's found"
-    else
-      let
-        (* Store data for Phase 2 *)
-        val _ = Desorry_Comm.sorry_states := sorry_states
-        val _ = Desorry_Comm.timeout := timeout
-
-        (* Evaluate Phase 2 within the theory context so that
-           Sledgehammer and other HOL structures are accessible *)
-        val _ = Context.setmp_generic_context
-          (SOME (Context.Theory init_thy))
-          (fn () => ML_Context.eval_file ML_Compiler.flags
-            (Path.explode phase2_path)) ()
-
-        (* Read results back from Phase 2 *)
-        val replacements = map (fn (l, t) =>
-          {line = l, text = t} : replacement)
-          (! Desorry_Comm.replacements)
-        val n_found = length replacements
-      in
-        if n_found = 0 then
-          writeln
-            "[RESULT] Sledgehammer could not find proofs for any sorry"
-        else
-          let
-            val modified = apply_replacements original replacements
-            val backup_path = Path.ext "backup" thy_file
-            val tmp_path = Path.ext "desorry_tmp" thy_file
-            (* Write backup of the original *)
-            val _ = File.write backup_path original
-            (* Atomic replacement: write to temp, then rename over original.
-               OS.FileSys.rename is atomic on POSIX — the original path always
-               points to either the complete old file or the complete new file,
-               never a truncated intermediate. *)
-            val _ = File.write tmp_path modified
-            val _ = OS.FileSys.rename {
-              old = File.platform_path tmp_path,
-              new = File.platform_path thy_file}
-          in
-            writeln ("desorry: backup written to " ^
-                     Path.implode backup_path);
-            writeln ("[RESULT] replaced " ^ Int.toString n_found ^
-                     " of " ^ Int.toString n_total ^ " sorry(s)")
-          end
-      end;
-
+    (let
+       val _ = Desorry_Comm.timeout := sledge_timeout;
+       val sorry_states = process transitions (Toplevel.make_state NONE) [];
+       val n_total = length sorry_states;
+     in
+       if n_total = 0 then
+         writeln "[RESULT] no sorry's found"
+       else
+         let
+           val _ = Desorry_Comm.sorry_states := sorry_states;
+           val _ = Context.setmp_generic_context
+             (SOME (Context.Theory init_thy))
+             (fn () => ML_Context.eval_file ML_Compiler.flags
+               (Path.explode phase2_path)) ();
+           val replacements = map (fn (l, t) =>
+             {line = l, text = t} : replacement)
+             (! Desorry_Comm.replacements);
+           val n_found = length replacements;
+         in
+           if n_found = 0 then
+             writeln
+               "[RESULT] Sledgehammer could not find proofs for any sorry"
+           else
+             let
+               val modified = apply_replacements original replacements;
+               val backup_path = Path.ext "backup" thy_file;
+               val tmp_path = Path.ext "desorry_tmp" thy_file;
+               val _ = File.write backup_path original;
+               val _ = File.write tmp_path modified;
+               val _ = OS.FileSys.rename {
+                 old = File.platform_path tmp_path,
+                 new = File.platform_path thy_file};
+             in
+               writeln ("desorry: backup written to " ^
+                        Path.implode backup_path);
+               writeln ("[RESULT] replaced " ^ Int.toString n_found ^
+                        " of " ^ Int.toString n_total ^ " sorry(s)")
+             end
+         end
+     end)
+    handle Desorry_Timeout (line, content) =>
+      writeln ("[RESULT] desorry: timed out after " ^ Int.toString cmd_timeout ^
+               "s at line " ^ Int.toString line ^ " (" ^ content ^
+               "); no changes written.");
 in
   writeln ${sentinel_end_ml}
 end;
@@ -460,7 +455,7 @@ end;
     options: Options,
     thy_file: Path,
     stop_line: Int = 0,
-    timeout: Int = 30,
+    cmd_timeout: Int = 60,
     target_lines: List[Int] = Nil,
     logic: String = "",
     dirs: List[Path] = Nil,
@@ -527,7 +522,9 @@ end;
       val phase2_path = tmp_dir + Path.explode("desorry_phase2.ML")
       File.write(phase2_path, ml_script_phase2())
 
-      val script_content = ml_script_phase1(thy_file, stop_line, timeout, target_lines, phase2_path)
+      val script_content =
+        ml_script_phase1(thy_file, stop_line, sledgehammer_timeout, cmd_timeout,
+          target_lines, phase2_path)
       val script_path = tmp_dir + Path.explode("desorry.ML")
       File.write(script_path, script_content)
 
@@ -597,7 +594,7 @@ end;
       var options = Options.init()
       var stop_line = 0
       var target_lines = List.empty[Int]
-      var timeout = 30
+      var cmd_timeout = 60
       var verbose = false
 
       val getopts = Getopts("""
@@ -608,7 +605,8 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
     -d DIR       include session directory for import resolution
     -l NAME      logic session name (override automatic derivation)
     -o OPTION    override Isabelle system option
-    -t SECS      Sledgehammer timeout per sorry (default: 30)
+    -t SECS      per-command timeout for replayed transitions
+                 (default: 60; 0 disables). Sledgehammer is fixed at 50s/sorry.
     -v           verbose
 
   Process THY_FILE: find all sorry proofs (up to LINE if given),
@@ -618,11 +616,14 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   The logic session is derived automatically from the theory's imports.
   Sibling imports in the same directory are loaded automatically.
+  Each replayed command is bounded by -t seconds; if a tactic exceeds it
+  (e.g. a non-terminating proof) desorry stops, reports the line, and writes
+  nothing.
 
   Examples:
     isabelle desorry Foo.thy
     isabelle desorry Foo.thy 42
-    isabelle desorry -t 60 Foo.thy
+    isabelle desorry -t 120 Foo.thy
     isabelle desorry -L 42,105 Foo.thy
     isabelle desorry -l HOL-Analysis Foo.thy
 """,
@@ -632,7 +633,7 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
         "d:" -> (arg => dirs += Path.explode(arg)),
         "l:" -> (arg => logic = arg),
         "o:" -> (arg => options = options + arg),
-        "t:" -> (arg => timeout = Value.Int.parse(arg)),
+        "t:" -> (arg => cmd_timeout = Value.Int.parse(arg)),
         "v" -> (_ => verbose = true))
 
       val (thy_file, line) =
@@ -644,7 +645,7 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
       val progress = new Console_Progress(verbose = verbose)
 
-      desorry(options, thy_file, stop_line = line, timeout = timeout,
+      desorry(options, thy_file, stop_line = line, cmd_timeout = cmd_timeout,
         target_lines = target_lines, logic = logic, dirs = dirs.toList,
         verbose = verbose, progress = progress)
     })
