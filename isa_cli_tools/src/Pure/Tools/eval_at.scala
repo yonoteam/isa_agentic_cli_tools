@@ -8,7 +8,9 @@ and including the target line (or injected command) are processed.  When no
 command is given, the output and state at the target line are shown.  The
 logic session and sibling imports are resolved automatically.
 
-Optional timing information (-t) can be reported for each processed command.
+A per-command timeout (-t SECS, default 60, 0 disables) aborts evaluation
+and reports the offending line if any transition exceeds the limit.
+Optional timing information (-T) can be reported for each processed command.
 */
 
 package isabelle
@@ -48,25 +50,32 @@ fun eval_at_with_local_protocol_handlers f x =
 
   /** generate ML script: state mode (no command injection) **/
 
-  private def ml_script_state(thy_file: Path, line: Int, timing: Boolean): String = {
+  private def ml_script_state(thy_file: Path, line: Int, timing: Boolean, cmd_timeout: Int): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val line_ml = ML_Syntax.print_int(line)
     val timing_ml = if (timing) "true" else "false"
+    val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
     val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
 ${ml_local_protocol_handlers}
 
+exception Eval_Timeout of int * string;
+
 let
   val thy_file    = Path.explode ${thy_path_ml};
   val target_line = ${line_ml} : int;
   val do_timing   = ${timing_ml};
+  val cmd_timeout = ${cmd_timeout_ml} : int;
 
   val original = File.read thy_file;
   val file_lines = String.fields (fn c => c = #"\\n") original;
 
-  (* pre-load local imports via Thy_Info so they are available *)
+  fun line_content l =
+    if l >= 1 andalso l <= length file_lines
+    then List.nth (file_lines, l - 1) else "";
+
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
   val options = Options.default [];
@@ -76,7 +85,6 @@ let
       else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
     ) (#imports header)) ();
 
-  (* init function: resolve imports from Thy_Info, create theory via Resources *)
   val init = fn () =>
     let
       val parents = map (fn (imp, _) => Thy_Info.get_theory imp) (#imports header);
@@ -86,7 +94,6 @@ let
   val pos = Position.file (Path.implode thy_file);
   val transitions = Outer_Syntax.parse_text init_thy (fn () => init_thy) pos original;
 
-  (* split transitions: before target line, at target line, after *)
   val (before_trs, at_trs) =
     let
       fun split trs bef ats =
@@ -104,7 +111,12 @@ let
   fun exec_timing tr st =
     let
       val start = Timing.start ();
-      val res = Toplevel.command_exception tr st;
+      val res =
+        (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+           (fn () => Toplevel.command_exception tr st) ()
+         handle Timeout.TIMEOUT _ =>
+           let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
+           in raise Eval_Timeout (l, line_content l) end);
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -114,54 +126,45 @@ let
               else ();
     in res end;
 
-  (* Phase 1: execute transitions before target line silently *)
   val () = writeln ${sentinel_start_ml};
-  val pre_st = fold (fn tr => fn st =>
-    exec_timing tr st
-    handle exn =>
-      let
-        val line_opt = Position.line_of (Toplevel.pos_of tr);
-        val fail_line = (case line_opt of SOME l => l | NONE => 0);
-        val fail_content =
-          if fail_line >= 1 andalso fail_line <= length file_lines
-          then List.nth (file_lines, fail_line - 1) else "";
-      in
-        writeln ("Error at line " ^
-                 Int.toString fail_line ^
-                 " (" ^ fail_content ^ "): " ^
-                 Runtime.exn_message exn);
-        writeln ${sentinel_end_ml};
-        Exn.reraise exn
-      end
-  ) before_trs (Toplevel.make_state NONE);
+  val () =
+    (let
+       val pre_st = fold (fn tr => fn st =>
+         exec_timing tr st
+         handle Eval_Timeout e => raise Eval_Timeout e
+              | exn =>
+           let
+             val line_opt = Position.line_of (Toplevel.pos_of tr);
+             val fail_line = (case line_opt of SOME l => l | NONE => 0);
+           in
+             writeln ("Error at line " ^ Int.toString fail_line ^
+                      " (" ^ line_content fail_line ^ "): " ^ Runtime.exn_message exn);
+             writeln ${sentinel_end_ml};
+             Exn.reraise exn
+           end
+       ) before_trs (Toplevel.make_state NONE);
 
-  (* Phase 2: execute transitions at target line with output capture *)
-  val (final_st, _) = fold (fn tr => fn (st, errored) =>
-    if errored then (st, true)
-    else
-      (exec_timing tr st, false)
-      handle exn =>
-        let
-          val fail_content =
-            if target_line >= 1 andalso target_line <= length file_lines
-            then List.nth (file_lines, target_line - 1) else "";
-        in
-          (writeln ("Error at line " ^
-                    Int.toString target_line ^
-                    " (" ^ fail_content ^ "): " ^
-                    Runtime.exn_message exn);
-           (st, true))
-        end
-  ) at_trs (pre_st, false);
+       val (final_st, _) = fold (fn tr => fn (st, errored) =>
+         if errored then (st, true)
+         else
+           (exec_timing tr st, false)
+           handle Eval_Timeout e => raise Eval_Timeout e
+                | exn =>
+             (writeln ("Error at line " ^ Int.toString target_line ^
+                       " (" ^ line_content target_line ^ "): " ^ Runtime.exn_message exn);
+              (st, true))
+       ) at_trs (pre_st, false);
 
-  (* also print proof state if available *)
-  val ps_output = Toplevel.pretty_state final_st;
-  val _ =
-    if null ps_output then
-      (if null at_trs then writeln "No proof state." else ())
-    else
-      List.app (fn p => writeln (Pretty.string_of p)) ps_output;
-
+       val ps_output = Toplevel.pretty_state final_st;
+       val _ =
+         if null ps_output then
+           (if null at_trs then writeln "No proof state." else ())
+         else
+           List.app (fn p => writeln (Pretty.string_of p)) ps_output;
+     in () end)
+    handle Eval_Timeout (line, content) =>
+      writeln ("eval_at: timed out after " ^ Int.toString cmd_timeout ^
+               "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
 in
   writeln ${sentinel_end_ml}
 end;
@@ -172,18 +175,21 @@ end;
   /** generate ML script: command injection mode **/
 
   private def ml_script_inject(
-    thy_file: Path, line: Int, command: String, show_state: Boolean, timing: Boolean
+    thy_file: Path, line: Int, command: String, show_state: Boolean, timing: Boolean, cmd_timeout: Int
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val line_ml = ML_Syntax.print_int(line)
     val command_ml = ML_Syntax.print_string_bytes(command)
     val show_state_ml = if (show_state) "true" else "false"
     val timing_ml = if (timing) "true" else "false"
+    val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
     val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
 ${ml_local_protocol_handlers}
+
+exception Eval_Timeout of int * string;
 
 let
   val thy_file    = Path.explode ${thy_path_ml};
@@ -191,10 +197,15 @@ let
   val command_str = ${command_ml};
   val show_state  = ${show_state_ml};
   val do_timing   = ${timing_ml};
+  val cmd_timeout = ${cmd_timeout_ml} : int;
 
-  (* read original theory and inject command after line N *)
   val original = File.read thy_file;
   val file_lines = String.fields (fn c => c = #"\\n") original;
+
+  fun line_content l =
+    if l >= 1 andalso l <= length file_lines
+    then List.nth (file_lines, l - 1) else "";
+
   val insert_off =
     List.foldl (fn (l, acc) => acc + String.size l + 1) 0
                (List.take (file_lines, Int.min (inject_line, length file_lines)));
@@ -202,13 +213,11 @@ let
   val modified =
     String.substring (original, 0, Int.min (insert_off, String.size original)) ^ injection;
 
-  (* content of the user-supplied line, for error diagnostics *)
-  val line_content =
+  val line_content_inj =
     if inject_line >= 1 andalso inject_line <= length file_lines
     then List.nth (file_lines, inject_line - 1)
     else "";
 
-  (* pre-load local imports via Thy_Info so they are available *)
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
   val options = Options.default [];
@@ -218,7 +227,6 @@ let
       else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
     ) (#imports header)) ();
 
-  (* init function: resolve imports from Thy_Info, create theory via Resources *)
   val init = fn () =>
     let
       val parents = map (fn (imp, _) => Thy_Info.get_theory imp) (#imports header);
@@ -228,7 +236,6 @@ let
   val pos = Position.file (Path.implode thy_file);
   val transitions = Outer_Syntax.parse_text init_thy (fn () => init_thy) pos modified;
 
-  (* split transitions into pre-injection and injected *)
   val inject_pos_line = inject_line + 1;
 
   val (pre_trs, inj_trs) =
@@ -245,7 +252,12 @@ let
   fun exec_timing tr st =
     let
       val start = Timing.start ();
-      val res = Toplevel.command_exception tr st;
+      val res =
+        (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+           (fn () => Toplevel.command_exception tr st) ()
+         handle Timeout.TIMEOUT _ =>
+           let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
+           in raise Eval_Timeout (l, line_content l) end);
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -255,47 +267,45 @@ let
               else ();
     in res end;
 
-  (* Phase 1: execute pre-injection transitions *)
   val () = writeln ${sentinel_start_ml};
-  val pre_st = fold (fn tr => fn st =>
-    exec_timing tr st
-    handle exn =>
-      let
-        val line_opt = Position.line_of (Toplevel.pos_of tr);
-        val fail_line = (case line_opt of SOME l => l | NONE => 0);
-        val fail_content =
-          if fail_line >= 1 andalso fail_line <= length file_lines
-          then List.nth (file_lines, fail_line - 1) else "";
-      in
-        writeln ("Error before injection at line " ^
-                 Int.toString fail_line ^
-                 " (" ^ fail_content ^ "): " ^
-                 Runtime.exn_message exn);
-        writeln ${sentinel_end_ml};
-        Exn.reraise exn
-      end
-  ) pre_trs (Toplevel.make_state NONE);
+  val () =
+    (let
+       val pre_st = fold (fn tr => fn st =>
+         exec_timing tr st
+         handle Eval_Timeout e => raise Eval_Timeout e
+              | exn =>
+           let
+             val line_opt = Position.line_of (Toplevel.pos_of tr);
+             val fail_line = (case line_opt of SOME l => l | NONE => 0);
+           in
+             writeln ("Error before injection at line " ^ Int.toString fail_line ^
+                      " (" ^ line_content fail_line ^ "): " ^ Runtime.exn_message exn);
+             writeln ${sentinel_end_ml};
+             Exn.reraise exn
+           end
+       ) pre_trs (Toplevel.make_state NONE);
 
-  (* Phase 2: execute injected transitions between sentinels *)
-  val (post_st, _) = fold (fn tr => fn (st, errored) =>
-    if errored then (st, true)
-    else
-      (exec_timing tr st, false)
-      handle exn =>
-        (writeln ("Error at line " ^ Int.toString inject_line ^
-                  " (" ^ line_content ^ "): " ^
-                  Runtime.exn_message exn);
-         (st, true))
-  ) inj_trs (pre_st, false);
+       val (post_st, _) = fold (fn tr => fn (st, errored) =>
+         if errored then (st, true)
+         else
+           (exec_timing tr st, false)
+           handle Eval_Timeout e => raise Eval_Timeout e
+                | exn =>
+             (writeln ("Error at line " ^ Int.toString inject_line ^
+                       " (" ^ line_content_inj ^ "): " ^ Runtime.exn_message exn);
+              (st, true))
+       ) inj_trs (pre_st, false);
 
-  (* optionally print proof state after injected command *)
-  val _ = if show_state then
-    let val output = Toplevel.pretty_state post_st in
-      if null output then writeln "No proof state."
-      else List.app (fn p => writeln (Pretty.string_of p)) output
-    end
-  else ();
-
+       val _ = if show_state then
+         let val output = Toplevel.pretty_state post_st in
+           if null output then writeln "No proof state."
+           else List.app (fn p => writeln (Pretty.string_of p)) output
+         end
+       else ();
+     in () end)
+    handle Eval_Timeout (line, content) =>
+      writeln ("eval_at: timed out after " ^ Int.toString cmd_timeout ^
+               "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
 in
   writeln ${sentinel_end_ml}
 end;
@@ -384,6 +394,7 @@ end;
     unicode_symbols: Boolean = false,
     show_state: Boolean = false,
     timing: Boolean = false,
+    cmd_timeout: Int = 60,
     verbose: Boolean = false,
     progress: Progress = new Progress
   ): Unit = {
@@ -446,8 +457,8 @@ end;
 
       val inject_mode = command.nonEmpty
       val script_content =
-        if (inject_mode) ml_script_inject(thy_file, line, command, show_state, timing)
-        else ml_script_state(thy_file, line, timing)
+        if (inject_mode) ml_script_inject(thy_file, line, command, show_state, timing, cmd_timeout)
+        else ml_script_state(thy_file, line, timing, cmd_timeout)
       val script_path = tmp_dir + Path.explode("eval_at.ML")
       File.write(script_path, script_content)
 
@@ -520,20 +531,22 @@ end;
       var unicode_symbols = false
       var show_state = false
       var timing = false
+      var cmd_timeout = 60
       var verbose = false
 
       val getopts = Getopts("""
 Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
 
   Options are:
-    -S           show sorts (implies types) in output
-    -T           show types in output
+    -S           show sorts and types in output
     -U           output Unicode symbols
     -d DIR       include session directory for import resolution
     -l NAME      logic session name (override automatic derivation)
     -o OPTION    override Isabelle system option
     -s           show proof state after command execution
-    -t           report timing for each processed line
+    -t SECS      per-command timeout for replayed transitions
+                 (default: 60; 0 disables)
+    -T           report timing for each processed line
     -v           verbose: show derived logic session, heap-check progress,
                  and ML process errors
 
@@ -556,20 +569,20 @@ Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
     isabelle eval_at -T Foo.thy 42
     isabelle eval_at Foo.thy 42 'find_theorems "_ + _"'
     isabelle eval_at Foo.thy 17 'sledgehammer'
-    isabelle eval_at -t Foo.thy 17 'sledgehammer'
+    isabelle eval_at -t 30 Foo.thy 17 'sledgehammer'
     isabelle eval_at -s Foo.thy 15 'apply auto'
     isabelle eval_at Foo.thy 10 'term "map f xs"'
     isabelle eval_at Foo.thy 10 'thm conjI'
     isabelle eval_at Foo.thy 10 'value "[1,2,3::nat]"'
 """,
         "S" -> (_ => { options = options + "show_sorts"; options = options + "show_types" }),
-        "T" -> (_ => options = options + "show_types"),
         "U" -> (_ => unicode_symbols = true),
         "d:" -> (arg => dirs += Path.explode(arg)),
         "l:" -> (arg => logic = arg),
         "o:" -> (arg => options = options + arg),
         "s" -> (_ => show_state = true),
-        "t" -> (_ => timing = true),
+        "t:" -> (arg => cmd_timeout = Value.Int.parse(arg)),
+        "T" -> (_ => timing = true),
         "v" -> (_ => verbose = true))
 
       val (thy_file, line, command) =
@@ -583,7 +596,7 @@ Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
 
       eval_at(options, thy_file, line, command = command, logic = logic,
         dirs = dirs.toList, unicode_symbols = unicode_symbols,
-        show_state = show_state, timing = timing, verbose = verbose,
-        progress = progress)
+        show_state = show_state, timing = timing, cmd_timeout = cmd_timeout,
+        verbose = verbose, progress = progress)
     })
 }
