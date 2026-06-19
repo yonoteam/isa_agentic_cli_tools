@@ -257,7 +257,11 @@ let
            (fn () => Toplevel.command_exception tr st) ()
          handle Timeout.TIMEOUT _ =>
            let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
-           in raise Eval_Timeout (l, line_content l) end);
+           in
+             if l >= inject_pos_line
+             then raise Eval_Timeout (inject_line, command_str)
+             else raise Eval_Timeout (l, line_content l)
+           end);
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
