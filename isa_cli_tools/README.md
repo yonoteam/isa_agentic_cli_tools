@@ -418,30 +418,30 @@ isabelle eval_at MyTheory.thy 15 'nitpick'
 
 | Option | Description |
 |--------|-------------|
-| `-S` | Show sorts (implies types) in output |
-| `-T` | Show types in output |
+| `-S` | Show sorts and types in output |
 | `-U` | Output Unicode symbols instead of Isabelle's ASCII encoding |
 | `-d DIR` | Add a session directory for ROOT file resolution (repeatable) |
 | `-l NAME` | Override the automatically derived logic session |
 | `-o OPTION` | Override an Isabelle system option |
 | `-s` | Show proof state after command output (for injection mode) |
-| `-t` | Report timing for each processed line |
+| `-t SECS` | Per-command timeout in seconds (default: 60; 0 disables) |
+| `-T` | Report timing for each processed line |
 | `-v` | Verbose: show derived session, heap-check progress, ML errors |
 
 Options must come before positional arguments.
 
-### The `-t` flag (Timing)
+### The `-T` flag (Timing)
 
-Use `-t` to see how long Isabelle takes to process each command from the beginning
+Use `-T` to see how long Isabelle takes to process each command from the beginning
 of the theory up to the target line. This is useful for identifying slow
 steps in a proof or evaluating the performance of an injected command.
 
 ```bash
 # Report timing for all lines leading up to line 15
-isabelle eval_at -t MyTheory.thy 15
+isabelle eval_at -T MyTheory.thy 15
 
 # Report timing for an injected command (e.g. sledgehammer)
-isabelle eval_at -t MyTheory.thy 15 'sledgehammer'
+isabelle eval_at -T MyTheory.thy 15 'sledgehammer'
 #> ...
 #> Timing line 15 (sledgehammer): 0.438s elapsed time, 0.711s cpu time, 0.167s GC time
 ```
@@ -468,6 +468,30 @@ isabelle eval_at -s MyTheory.thy 15 'apply auto'
 
 Informational commands (`thm`, `term`, `value`, `find_theorems`) produce their
 own output; `-s` is unnecessary for them (but harmless).
+
+### Per-command timeout (`-t`)
+
+Both `eval_at` and `desorry` accept `-t SECS` (default: 60; use 0 to disable).
+This bounds the time allowed for each individual replayed Isabelle transition
+(e.g. a single `apply`, `by`, or `have` step). It is a **per-command** timeout,
+not a total timeout — so large theories with many fast commands are not
+penalized, but a single looping tactic is caught and named.
+
+When a command exceeds `-t`:
+
+- **`eval_at`** aborts and prints the offending line, e.g.:
+  ```
+  eval_at: timed out after 60s at line 42 (apply (induct n)); aborting
+  ```
+  In injection mode the injected command and its line are reported.
+
+- **`desorry`** aborts immediately, prints the offending line, and writes
+  **nothing** — the input file is left unchanged and no `.backup` is created:
+  ```
+  desorry: timed out after 60s at line 17 (apply auto); no changes written.
+  ```
+
+To disable the timeout entirely (not recommended for agent use): `-t 0`.
 
 ### Precondition: All Prior Commands Must Succeed
 
@@ -513,8 +537,10 @@ found proofs substituted for the corresponding `sorry`s.
 | `-d DIR` | Add session directory for import resolution (repeatable) |
 | `-l NAME` | Override automatically derived logic session |
 | `-o OPT` | Override Isabelle system option |
-| `-t SECS` | Sledgehammer timeout per sorry (default: 30) |
+| `-t SECS` | Per-command timeout for replayed transitions (default: 60; 0 disables) |
 | `-v` | Verbose |
+
+Sledgehammer is run at a fixed timeout of 50 seconds per sorry (not configurable).
 
 ### Examples
 
@@ -528,8 +554,8 @@ isabelle desorry Foo.thy 100
 # Only process sorry's at specific lines
 isabelle desorry -L 42,105 Foo.thy
 
-# Use a 60-second timeout per sorry
-isabelle desorry -t 60 Foo.thy
+# Use a 120-second per-command timeout
+isabelle desorry -t 120 Foo.thy
 
 # Specify the logic session explicitly
 isabelle desorry -l HOL-Analysis Foo.thy
@@ -608,8 +634,9 @@ yourself first with `isabelle build -b SESSION [-d ROOT_DIR]`. See
 tools leave that decision to you.
 
 **Sledgehammer finds nothing**
-Try: longer timeout (`-t 60` for desorry, or
-`'sledgehammer [timeout = 60]'` for eval_at), different provers
+`desorry` runs Sledgehammer at a fixed 50-second timeout per sorry (not
+configurable). For `eval_at`, try a longer timeout:
+`'sledgehammer [timeout = 60]'`. In both cases, try different provers
 (`'sledgehammer [provers = "vampire e cvc5"]'`), or simplify the goal
 with manual tactics first.
 
