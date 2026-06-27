@@ -8,6 +8,15 @@ and including the target line (or injected command) are processed.  When no
 command is given, the output and state at the target line are shown.  The
 logic session and sibling imports are resolved automatically.
 
+In state mode (no command) every error up to the target line is reported, each
+with its line, instead of stopping at the first; after a failed transition
+processing continues from the previous state (via Toplevel.command_errors).
+Warnings and legacy-feature messages emitted in state mode are likewise
+attributed to their line ("Warning at line N: ...") rather than the unattributed
+"### msg" default.  Injection mode (with a command) keeps fast-fail: an error
+before the injection point aborts, since the injected command cannot run on a
+broken context.
+
 A per-command timeout (-t SECS, default 60, 0 disables) aborts evaluation
 and reports the offending line if any transition exceeds the limit.
 Optional timing information (-T) can be reported for each processed command.
@@ -108,12 +117,12 @@ let
             | NONE => split rest (tr :: bef) ats))
     in split transitions [] [] end;
 
-  fun exec_timing tr st =
+  fun exec_errors tr st =
     let
       val start = Timing.start ();
       val res =
         (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-           (fn () => Toplevel.command_exception tr st) ()
+           (fn () => Toplevel.command_errors tr st) ()
          handle Timeout.TIMEOUT _ =>
            let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
            in raise Eval_Timeout (l, line_content l) end);
@@ -126,34 +135,46 @@ let
               else ();
     in res end;
 
+  fun report_errors report_line errs =
+    List.app (fn ((_, msg), _) =>
+      writeln ("Error at line " ^ Int.toString report_line ^
+               " (" ^ line_content report_line ^ "): " ^ msg)) errs;
+
+  (* Run one transition.  command_errors collects messages without raising and
+     yields NONE on failure, so we report every error and continue from the
+     previous state.  State mode therefore reports ALL errors up to the target
+     line instead of stopping at the first.  (Injection mode keeps fast-fail.) *)
+  (* Capture warning/legacy messages emitted while a transition runs and re-emit
+     them attributed to that transition's line (we process one transition at a
+     time, so the attribution is exact).  Replaces the unattributed "### msg"
+     default with "Warning at line N (...): msg", matching the error format. *)
+  fun step report_line tr st =
+    let
+      val warn_buf = Unsynchronized.ref ([] : string list);
+      val capture = (fn ss => warn_buf := implode ss :: ! warn_buf);
+      val (errs, st_opt) =
+        Unsynchronized.setmp Private_Output.warning_fn capture
+          (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture
+             (fn () => exec_errors tr st) ()) ();
+      val _ = List.app (fn msg =>
+        writeln ("Warning at line " ^ Int.toString report_line ^
+                 " (" ^ line_content report_line ^ "): " ^ msg)) (rev (! warn_buf));
+    in
+      (case st_opt of
+        SOME st' => st'
+      | NONE => (report_errors report_line errs; st))
+    end;
+
   val () = writeln ${sentinel_start_ml};
   val () =
     (let
        val pre_st = fold (fn tr => fn st =>
-         exec_timing tr st
-         handle Eval_Timeout e => raise Eval_Timeout e
-              | exn =>
-           let
-             val line_opt = Position.line_of (Toplevel.pos_of tr);
-             val fail_line = (case line_opt of SOME l => l | NONE => 0);
-           in
-             writeln ("Error at line " ^ Int.toString fail_line ^
-                      " (" ^ line_content fail_line ^ "): " ^ Runtime.exn_message exn);
-             writeln ${sentinel_end_ml};
-             Exn.reraise exn
-           end
+         step (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0) tr st
        ) before_trs (Toplevel.make_state NONE);
 
-       val (final_st, _) = fold (fn tr => fn (st, errored) =>
-         if errored then (st, true)
-         else
-           (exec_timing tr st, false)
-           handle Eval_Timeout e => raise Eval_Timeout e
-                | exn =>
-             (writeln ("Error at line " ^ Int.toString target_line ^
-                       " (" ^ line_content target_line ^ "): " ^ Runtime.exn_message exn);
-              (st, true))
-       ) at_trs (pre_st, false);
+       val final_st = fold (fn tr => fn st =>
+         step target_line tr st
+       ) at_trs pre_st;
 
        val ps_output = Toplevel.pretty_state final_st;
        val _ =

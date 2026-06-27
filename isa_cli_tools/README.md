@@ -379,6 +379,30 @@ isabelle eval_at MyTheory.thy 3
 #> No proof state.
 ```
 
+State mode reports **every** error up to LINE, not just the first: after a
+failed transition it continues from the previous state, so one run surfaces all
+independent (e.g. theory-level) errors instead of one-per-run. Point LINE at the
+last line to validate a whole file in a single pass.
+
+```bash
+isabelle eval_at MyTheory.thy 40    # last line
+#> Error at line 7 (thm foo): Undefined fact: "foo" ...
+#> Error at line 19 (lemma bar: "X = Y"): Type unification failed ...
+```
+
+(A failure inside a proof body can still produce follow-on noise; in the
+intended skeleton workflow every leaf is `sorry`, so failures are predominantly
+theory-level and recover cleanly.)
+
+Warnings and legacy-feature messages in state mode are attributed to their line
+too, as `Warning at line N (...): msg` (instead of the unattributed `### msg`),
+so they are as easy to locate and grep as errors:
+
+```bash
+isabelle eval_at MyTheory.thy 40
+#> Warning at line 12 (...): Introduced fixed type variable(s): 'a in "x__"
+```
+
 ### Command injection mode
 
 When COMMAND is given, it is injected after LINE and executed. The command's
@@ -493,21 +517,27 @@ When a command exceeds `-t`:
 
 To disable the timeout entirely (not recommended for agent use): `-t 0`.
 
-### Precondition: All Prior Commands Must Succeed
+### Prior commands and errors
 
-`eval_at` replays every Isabelle command from the top of the theory file down
-to LINE. **All commands before LINE must be accepted by Isabelle** (no errors).
+`eval_at` replays every Isabelle command from the top of the theory file down to
+LINE. How prior errors are handled depends on the mode:
 
-If a prior command fails, `eval_at` reports the error:
+- **State mode (no COMMAND)** reports *every* error up to LINE and keeps going,
+  continuing from the state before each failed transition. Use it to validate a
+  file (point LINE at the last line). The proof state shown at LINE is only
+  meaningful when the commands it depends on succeeded.
+- **Injection mode (COMMAND given)** requires a clean prefix: an error before the
+  injection point aborts with `Error before injection at line N`, because the
+  injected command cannot run on a broken context.
 
 ```
-Error at line 20 (  apply (rule foo)): Unknown fact "foo"
+Error at line 20 (  apply (rule foo)): Undefined fact: "foo"
 ```
 
 Before calling eval_at:
 
-1. **Verify the theory is error-free up to LINE.** Run `eval_at` without a
-   command first — if it shows state without errors, the context is valid.
+1. **To get a valid state/output at LINE**, make sure the commands it depends on
+   are error-free — run state mode first and check for any `Error at line` lines.
 
 2. **`sorry` is tolerated** (accepted under `quick_and_dirty`), but changes
    the logical context. Proofs found after a `sorry` may depend on sorry'd
