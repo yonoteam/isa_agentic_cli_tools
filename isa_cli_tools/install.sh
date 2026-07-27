@@ -164,8 +164,24 @@ echo "Step 7/7: Verifying installation..."
 # Invoke with no args: registered tools print usage (rc=1), unregistered tools
 # print "Unknown Isabelle tool" (rc=2).  Check the output for "Usage:".
 # Use a subshell to avoid pipefail propagating the non-zero rc from the tool.
-(set +o pipefail; "$ISABELLE_HOME/bin/isabelle" eval_at 2>&1 | grep -q "^Usage:") && echo "  eval_at: OK" || echo "  eval_at: FAILED"
-(set +o pipefail; "$ISABELLE_HOME/bin/isabelle" desorry 2>&1 | grep -q "^Usage:") && echo "  desorry: OK" || echo "  desorry: FAILED"
+VERIFY_FAILED=false
+if (set +o pipefail; "$ISABELLE_HOME/bin/isabelle" eval_at 2>&1 | grep -q "^Usage:"); then
+  echo "  eval_at: OK"
+else
+  echo "  eval_at: FAILED"
+  VERIFY_FAILED=true
+fi
+if (set +o pipefail; "$ISABELLE_HOME/bin/isabelle" desorry 2>&1 | grep -q "^Usage:"); then
+  echo "  desorry: OK"
+else
+  echo "  desorry: FAILED"
+  VERIFY_FAILED=true
+fi
+
+if [ "$VERIFY_FAILED" = true ]; then
+  echo "ERROR: Installation verification failed." >&2
+  exit 1
+fi
 
 # ── Done ─────────────────────────────────────────────────────────────────
 echo ""

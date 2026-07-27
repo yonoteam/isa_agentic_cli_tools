@@ -656,10 +656,12 @@ isabelle desorry -l HOL-Analysis Foo.thy
    the first ordinary replay error.
 2. **Phase 2 (parallel):** Runs Sledgehammer concurrently on all
    collected proof states.
-3. **Output:** Overwrites `THY_FILE` in-place with each processed `sorry`
-   replaced by the Sledgehammer-found proof text (e.g. `by simp`,
-   `by (metis foo bar)`), preserving indentation. Sorry's for which no
-   proof was found (or those excluded by `-L`) are left unchanged.
+3. **Commit:** ML writes a staged theory only inside its supervised temporary
+   directory. After the ML process exits cleanly, Scala creates the backup and
+   atomically replaces `THY_FILE`. Each processed `sorry` is replaced by the
+   Sledgehammer-found proof text (e.g. `by simp`, `by (metis foo bar)`),
+   preserving indentation. Sorry's for which no proof was found (or those
+   excluded by `-L`) are left unchanged.
 
 ### Backup mechanism
 

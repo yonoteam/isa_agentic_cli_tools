@@ -44,7 +44,13 @@ object Eval_At {
 
   /** generate ML script: state mode (no command injection) **/
 
-  private def ml_script_state(thy_file: Path, line: Int, timing: Boolean, cmd_timeout: Int): String = {
+  private def ml_script_state(
+    thy_file: Path,
+    line: Int,
+    timing: Boolean,
+    cmd_timeout: Int,
+    event_token: String
+  ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val line_ml = ML_Syntax.print_int(line)
     val timing_ml = if (timing) "true" else "false"
@@ -52,7 +58,7 @@ object Eval_At {
 
     s"""
 ${Cli_Tool_Common.ml_protocol_handlers}
-${Cli_Tool_Common.ml_event_protocol}
+${Cli_Tool_Common.ml_event_protocol(event_token)}
 
 exception Eval_Timeout of int * string;
 
@@ -161,12 +167,16 @@ let
      default with "Warning at line N (...): msg", matching the error format. *)
   fun step report_line tr st =
     let
+      val out_buf = Unsynchronized.ref ([] : string list);
       val warn_buf = Unsynchronized.ref ([] : string list);
+      val capture_out = (fn ss => out_buf := implode ss :: ! out_buf);
       val capture = (fn ss => warn_buf := implode ss :: ! warn_buf);
       val (errs, st_opt) =
-        Unsynchronized.setmp Private_Output.warning_fn capture
-          (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture
-             (fn () => exec_errors tr st) ()) ();
+        Unsynchronized.setmp Private_Output.writeln_fn capture_out
+          (fn () => Unsynchronized.setmp Private_Output.warning_fn capture
+            (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture
+               (fn () => exec_errors tr st) ()) ()) ();
+      val _ = List.app CLI_Tool_Event.result (rev (! out_buf));
       val _ = List.app (fn msg =>
         CLI_Tool_Event.warning
           ("Warning at line " ^ Int.toString report_line ^
@@ -209,7 +219,13 @@ end;
   /** generate ML script: command injection mode **/
 
   private def ml_script_inject(
-    thy_file: Path, line: Int, command: String, show_state: Boolean, timing: Boolean, cmd_timeout: Int
+    thy_file: Path,
+    line: Int,
+    command: String,
+    show_state: Boolean,
+    timing: Boolean,
+    cmd_timeout: Int,
+    event_token: String
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val line_ml = ML_Syntax.print_int(line)
@@ -220,7 +236,7 @@ end;
 
     s"""
 ${Cli_Tool_Common.ml_protocol_handlers}
-${Cli_Tool_Common.ml_event_protocol}
+${Cli_Tool_Common.ml_event_protocol(event_token)}
 
 exception Eval_Timeout of int * string;
 
@@ -324,10 +340,30 @@ let
       val _ = note_progress tr;
     in res end;
 
+  fun exec_captured tr st =
+    let
+      val line =
+        (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0);
+      val out_buf = Unsynchronized.ref ([] : string list);
+      val warn_buf = Unsynchronized.ref ([] : string list);
+      val capture_out = (fn ss => out_buf := implode ss :: ! out_buf);
+      val capture_warn = (fn ss => warn_buf := implode ss :: ! warn_buf);
+      val result =
+        Unsynchronized.setmp Private_Output.writeln_fn capture_out
+          (fn () => Unsynchronized.setmp Private_Output.warning_fn capture_warn
+            (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture_warn
+              (fn () => Exn.result (fn () => exec_timing tr st) ()) ()) ()) ();
+      val _ = List.app CLI_Tool_Event.result (rev (! out_buf));
+      val _ = List.app (fn msg =>
+        CLI_Tool_Event.warning
+          ("Warning at line " ^ Int.toString line ^
+           " (" ^ line_content line ^ "): " ^ msg)) (rev (! warn_buf));
+    in Exn.release result end;
+
   val () =
     (let
        val pre_st = fold (fn tr => fn st =>
-         exec_timing tr st
+         exec_captured tr st
          handle Eval_Timeout e => raise Eval_Timeout e
               | exn =>
            let
@@ -345,7 +381,7 @@ let
        val (post_st, _) = fold (fn tr => fn (st, errored) =>
          if errored then (st, true)
          else
-           (exec_timing tr st, false)
+           (exec_captured tr st, false)
            handle Eval_Timeout e => raise Eval_Timeout e
                 | exn =>
              (CLI_Tool_Event.warning
@@ -424,8 +460,11 @@ end;
           val script_content =
             if (inject_mode)
               ml_script_inject(
-                thy_file, line, command, show_state, timing, cmd_timeout)
-            else ml_script_state(thy_file, line, timing, cmd_timeout)
+                thy_file, line, command, show_state, timing, cmd_timeout,
+                reporter.event_token)
+            else
+              ml_script_state(
+                thy_file, line, timing, cmd_timeout, reporter.event_token)
           val script_path = tmp_dir + Path.explode("eval_at.ML")
           File.write(script_path, script_content)
           script_path

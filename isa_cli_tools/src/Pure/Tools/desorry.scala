@@ -18,6 +18,9 @@ The ML script is split into two phases:
     are accessible.  (After Pure.thy sets ML_write_global = false, HOL
     structures only exist in the theory-local ML namespace.)
 Communication between phases uses refs in a global ML structure.
+Successful replacements are staged in the supervised temporary directory;
+Scala commits the backup and atomic target rename only after a clean ML
+outcome.
 
 Replay stops at the first ordinary error, before proof search or mutation.
 Explicit -L targets must be unique, positive, in range, reachable before the
@@ -45,6 +48,7 @@ object Desorry {
   /** Sledgehammer timeout per sorry (seconds), fixed **/
 
   private val sledgehammer_timeout = 50
+  private val staged_artifact = "desorry_staged.thy"
 
   /** Phase 2 ML script: Sledgehammer invocation (evaluated within theory context) **/
 
@@ -201,7 +205,8 @@ end;
 
   private def ml_script_phase1(
     thy_file: Path, stop_line: Int, sledge_timeout: Int, cmd_timeout: Int,
-    target_lines: List[Int], phase2_path: Path
+    target_lines: List[Int], phase2_path: Path, staged_path: Path,
+    event_token: String
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val stop_line_ml = ML_Syntax.print_int(stop_line)
@@ -209,10 +214,11 @@ end;
     val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
     val target_lines_ml = ML_Syntax.print_list(ML_Syntax.print_int)(target_lines)
     val phase2_path_ml = ML_Syntax.print_string_bytes(File.platform_path(phase2_path))
+    val staged_path_ml = ML_Syntax.print_string_bytes(File.platform_path(staged_path))
 
     s"""
 ${Cli_Tool_Common.ml_protocol_handlers}
-${Cli_Tool_Common.ml_event_protocol}
+${Cli_Tool_Common.ml_event_protocol(event_token)}
 
 structure Desorry_Comm = struct
   val sorry_states : (int * Proof.state) list Unsynchronized.ref = Unsynchronized.ref [];
@@ -230,6 +236,7 @@ let
   val cmd_timeout = ${cmd_timeout_ml} : int;
   val target_lines = ${target_lines_ml} : int list;
   val phase2_path = ${phase2_path_ml};
+  val staged_path = Path.explode ${staged_path_ml};
 
   val thy_file = Path.explode thy_path;
   val original = File.read thy_file;
@@ -310,10 +317,19 @@ let
   fun execute_transition tr st =
     let
       val line = the_default 0 (transition_line tr);
+      val warn_buf = Unsynchronized.ref ([] : string list);
+      val capture_warn = (fn ss => warn_buf := implode ss :: ! warn_buf);
       val result =
-        Exn.result (fn () =>
-          Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-            (fn () => Toplevel.command_exception tr st) ()) ();
+        Unsynchronized.setmp Private_Output.writeln_fn (fn _ => ())
+          (fn () => Unsynchronized.setmp Private_Output.warning_fn capture_warn
+            (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture_warn
+              (fn () => Exn.result (fn () =>
+                Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+                  (fn () => Toplevel.command_exception tr st) ()) ()) ()) ()) ();
+      val _ = List.app (fn msg =>
+        CLI_Tool_Event.warning
+          ("Warning at line " ^ Int.toString line ^
+           " (" ^ line_content line ^ "): " ^ msg)) (rev (! warn_buf));
     in
       (case result of
         Exn.Res st' => (note_progress tr; st')
@@ -411,18 +427,8 @@ let
              else
                let
                  val modified = apply_replacements original replacements;
-                 val backup_path = Path.ext "backup" thy_file;
-                 val tmp_path = Path.ext "desorry_tmp" thy_file;
-                 val _ = File.write backup_path original;
-                 val _ = File.write tmp_path modified;
-                 val _ = OS.FileSys.rename {
-                   old = File.platform_path tmp_path,
-                   new = File.platform_path thy_file};
                in
-                 CLI_Tool_Event.warning
-                   ("replaced " ^ Int.toString n_found ^ " of " ^
-                    Int.toString n_total ^ " sorry(s); backup written to " ^
-                    Path.implode backup_path)
+                 File.write staged_path modified
                end
            end
        end)
@@ -506,8 +512,14 @@ end;
         Cli_Tool_Common.Status(phase = "startup"))
 
       val outcome =
-        Cli_Tool_Common.run_ml_process(options, prepared, reporter) { tmp_dir =>
+        Cli_Tool_Common.run_ml_process(
+          options,
+          prepared,
+          reporter,
+          artifact_names = List(staged_artifact)
+        ) { tmp_dir =>
           val phase2_path = tmp_dir + Path.explode("desorry_phase2.ML")
+          val staged_path = tmp_dir + Path.basic(staged_artifact)
           File.write(phase2_path, ml_script_phase2())
           val script_path = tmp_dir + Path.explode("desorry.ML")
           File.write(
@@ -518,11 +530,46 @@ end;
               sledgehammer_timeout,
               cmd_timeout,
               target_lines,
-              phase2_path))
+              phase2_path,
+              staged_path,
+              reporter.event_token))
           script_path
         }
 
-      outcome.exit_code
+      if (outcome.exit_code != 0) outcome.exit_code
+      else {
+        outcome.artifacts.get(staged_artifact) match {
+          case None => 0
+          case Some(modified) =>
+            val target = prepared.thy_file.absolute
+            val backup_path = target.ext("backup")
+            val tmp_path = target.ext("desorry_tmp")
+
+            def remove_tmp(): Unit =
+              if (tmp_path.is_file) {
+                try { tmp_path.file.delete(); () }
+                catch { case _: Throwable => }
+              }
+
+            try {
+              File.write(tmp_path, modified)
+              File.write(backup_path, prepared.content)
+              Isabelle_System.move_file(tmp_path, target)
+              reporter.warning(
+                "proof replacements committed; backup written to " +
+                  backup_path.implode)
+              0
+            }
+            catch {
+              case exn if !Exn.is_interrupt(exn) =>
+                remove_tmp()
+                reporter.fatal(
+                  "could not commit proof replacements: " +
+                    Exn.message(exn))
+                1
+            }
+        }
+      }
     }
   }
 

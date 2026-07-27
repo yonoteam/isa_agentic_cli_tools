@@ -158,10 +158,21 @@ fun cli_tool_with_local_protocol_handlers f x =
   final case class Warning_Event(message: String) extends Event
   final case class Fatal_Event(message: String) extends Event
 
-  val ml_event_protocol: String =
-    """
-structure CLI_Tool_Event = struct
-  val prefix = "@@ISABELLE_CLI_EVENT@@";
+  def ml_event_protocol(token: String): String = {
+    val prefix_ml =
+      ML_Syntax.print_string_bytes(event_prefix + token)
+
+    raw"""
+structure CLI_Tool_Event:
+sig
+  val status:
+    string -> int option -> int option -> int option -> int option -> unit
+  val result: string -> unit
+  val warning: string -> unit
+  val fatal: string -> unit
+end =
+struct
+  val prefix = ${prefix_ml};
 
   fun escape_char "\\" = "\\\\"
     | escape_char "\t" = "\\t"
@@ -175,7 +186,8 @@ structure CLI_Tool_Event = struct
     | optional_int name (SOME value) = [(name, Int.toString value)];
 
   fun emit kind fields =
-    writeln (space_implode "\t" (prefix :: kind :: map field fields));
+    Output.physical_writeln
+      (space_implode "\t" (prefix :: kind :: map field fields));
 
   fun status phase current total completed work_total =
     emit "STATUS"
@@ -190,6 +202,7 @@ structure CLI_Tool_Event = struct
   fun fatal message = emit "FATAL" [("message", message)];
 end;
 """
+  }
 
   private def malformed_event(message: String): Fatal_Event =
     Fatal_Event("malformed CLI event: " + message)
@@ -218,13 +231,14 @@ end;
     result.toString
   }
 
-  private def decode_event(line: String): Option[Event] = {
-    if (!line.startsWith(event_prefix)) None
+  private def decode_event(line: String, token: String): Option[Event] = {
+    val expected_prefix = event_prefix + token
+    if (!line.startsWith(expected_prefix)) None
     else {
       Some(
         try {
           val parts = space_explode('\t', line)
-          if (parts.length < 2 || parts.head != event_prefix)
+          if (parts.length < 2 || parts.head != expected_prefix)
             error("missing event kind")
           val kind = parts(1)
           val entries = parts.drop(2).map { entry =>
@@ -298,6 +312,8 @@ end;
     verbose: Boolean,
     recode: String => String
   ) {
+    val event_token: String = UUID.random_string()
+
     private val heartbeat_interval = Time.seconds(15)
     private val state =
       Synchronized(Reporter_State(Status(), Time.now(), None, 0))
@@ -381,11 +397,16 @@ end;
       }
 
     private def maybe_heartbeat(): Unit = {
-      val snapshot = state.value
-      if (Time.now() - snapshot.last_visible >= heartbeat_interval) {
-        visible(
-          tool_name + ": still working: " + heartbeat_detail(snapshot.status) +
-            " (15s without output)")
+      output_lock.synchronized {
+        val snapshot = state.value
+        if (Time.now() - snapshot.last_visible >= heartbeat_interval) {
+          Output.writeln(
+            recode(
+              tool_name + ": still working: " +
+                heartbeat_detail(snapshot.status) +
+                " (15s without output)"))
+          state.change(st => st.copy(last_visible = Time.now()))
+        }
       }
     }
 
@@ -420,7 +441,8 @@ end;
   final case class Run_Outcome(
     process_result: Process_Result,
     fatal_message: Option[String],
-    timed_out: Boolean
+    timed_out: Boolean,
+    artifacts: Map[String, String]
   ) {
     def exit_code: Int =
       if (fatal_message.nonEmpty || timed_out || process_result.rc != 0) 1 else 0
@@ -429,12 +451,20 @@ end;
   def run_ml_process(
     options: Options,
     prepared: Prepared_Theory,
-    reporter: Reporter
+    reporter: Reporter,
+    artifact_names: List[String] = Nil
   )(write_program: Path => Path): Run_Outcome = {
     Isabelle_System.with_tmp_dir("cli_tool") { tmp_dir =>
       val script_path = write_program(tmp_dir)
+      val wall_timeout =
+        sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
+          case Some(s) if s.nonEmpty => Value.Int.parse(s)
+          case _ => 900
+        }
       val server = Bash.Server.start(Logger.none)
       var watchdog: Option[Future[Unit]] = None
+      var process: Option[Bash.Process] = None
+      var process_joined = false
 
       try {
         val store = Store(options)
@@ -447,7 +477,7 @@ end;
             qd_options, prepared.logic, dirs = prepared.dirs).check_errors
         val session_heaps =
           store.session_heaps(session_background, logic = prepared.logic)
-        val (_, process) =
+        val (_, ml_process) =
           ML_Process(
             qd_options,
             session_background,
@@ -455,12 +485,7 @@ end;
             args = List("--use", File.platform_path(script_path)),
             cwd = prepared.thy_dir,
             redirect = false)
-
-        val wall_timeout =
-          sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
-            case Some(s) if s.nonEmpty => Value.Int.parse(s)
-            case _ => 900
-          }
+        process = Some(ml_process)
         val timed_out = Synchronized(false)
         val received_event = Synchronized(false)
         watchdog =
@@ -472,13 +497,17 @@ end;
                 reporter.fatal(
                   "wall-clock timeout after " + wall_timeout +
                     "s; ML process terminated to avoid an orphaned session.")
-                process.terminate()
+                ml_process.terminate()
               })
           }
           else None
 
         def stdout(line: String): Unit =
-          decode_event(line) match {
+          decode_event(line, reporter.event_token) match {
+            case Some(event @ Fatal_Event(_)) =>
+              received_event.change(_ => true)
+              reporter.handle(event)
+              ml_process.terminate()
             case Some(event) =>
               received_event.change(_ => true)
               reporter.handle(event)
@@ -488,17 +517,18 @@ end;
                 line != "don't export proof" &&
                 line != "val it = (): unit"
               )
-                reporter.result(line)
+                reporter.diagnostic(line)
           }
 
         def stderr(line: String): Unit =
           reporter.diagnostic(line)
 
         val result =
-          process.result(
+          ml_process.result(
             progress_stdout = stdout,
             progress_stderr = stderr,
             strict = false)
+        process_joined = true
 
         if (result.rc != 0 && reporter.fatal_message.isEmpty) {
           reporter.fatal("ML process failed (return code " + result.rc + ").")
@@ -507,10 +537,26 @@ end;
             reporter.diagnostic(result.out)
         }
 
-        Run_Outcome(result, reporter.fatal_message, timed_out.value)
+        val preliminary =
+          Run_Outcome(
+            result, reporter.fatal_message, timed_out.value, Map.empty)
+        val artifacts =
+          if (preliminary.exit_code == 0) {
+            artifact_names.flatMap { name =>
+              val path = tmp_dir + Path.basic(name)
+              if (path.is_file) Some(name -> File.read(path)) else None
+            }.toMap
+          }
+          else Map.empty
+
+        preliminary.copy(artifacts = artifacts)
       }
       finally {
-        watchdog.foreach(_.cancel())
+        watchdog.foreach { thread =>
+          thread.cancel()
+          thread.join_result
+        }
+        if (!process_joined) process.foreach(_.terminate())
         server.stop()
       }
     }
