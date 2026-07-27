@@ -517,6 +517,23 @@ When a command exceeds `-t`:
 
 To disable the timeout entirely (not recommended for agent use): `-t 0`.
 
+### Overall wall-clock safeguard
+
+Both tools also enforce an **overall wall-clock bound** that hard-terminates the
+spawned ML process group if a whole run runs too long (default **900 s / 15 min**).
+Unlike `-t`, this also catches hangs *outside* command evaluation — session-heap
+loading, GC/swap thrash — that would otherwise leave an **orphaned multi-GB
+`poly` process** behind after the controlling tool is gone.
+
+This is a machine-protection safeguard, **not** a per-call flag, and agents
+should not need to think about it. For the rare genuinely-huge heap (or for
+tests) it can be overridden via the environment variable
+`ISABELLE_CLI_TOOLS_WALL_TIMEOUT` (seconds; `0` disables):
+
+```bash
+ISABELLE_CLI_TOOLS_WALL_TIMEOUT=3600 isabelle eval_at Big.thy 200
+```
+
 ### Prior commands and errors
 
 `eval_at` replays every Isabelle command from the top of the theory file down to

@@ -10,7 +10,7 @@ logic session and sibling imports are resolved automatically.
 
 In state mode (no command) every error up to the target line is reported, each
 with its line, instead of stopping at the first; after a failed transition
-processing continues from the previous state (via Toplevel.command_errors).
+processing continues from the previous state.
 Warnings and legacy-feature messages emitted in state mode are likewise
 attributed to their line ("Warning at line N: ...") rather than the unattributed
 "### msg" default.  Injection mode (with a command) keeps fast-fail: an error
@@ -20,6 +20,13 @@ broken context.
 A per-command timeout (-t SECS, default 60, 0 disables) aborts evaluation
 and reports the offending line if any transition exceeds the limit.
 Optional timing information (-T) can be reported for each processed command.
+
+An overall wall-clock safeguard hard-terminates the spawned ML process group if
+the whole run exceeds a bound (default 900s; override via the env var
+ISABELLE_CLI_TOOLS_WALL_TIMEOUT, 0 disables).  Unlike -t, this also bounds hangs
+outside command evaluation (session-heap loading, GC/swap thrash) that would
+otherwise leave an orphaned multi-GB poly process behind.  It is a
+machine-protection safeguard, deliberately not a per-call flag.
 */
 
 package isabelle
@@ -87,7 +94,7 @@ let
 
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default [];
+  val options = Options.default ();
   val _ = eval_at_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
@@ -121,11 +128,9 @@ let
     let
       val start = Timing.start ();
       val res =
-        (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-           (fn () => Toplevel.command_errors tr st) ()
-         handle Timeout.TIMEOUT _ =>
-           let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
-           in raise Eval_Timeout (l, line_content l) end);
+        Exn.result (fn () =>
+          Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+            (fn () => Toplevel.command_exception true tr st) ()) ();
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -133,17 +138,26 @@ let
                   val name = Toplevel.name_of tr
                 in writeln ("Timing line " ^ Int.toString l ^ " (" ^ name ^ "): " ^ Timing.message t) end
               else ();
-    in res end;
+    in
+      (case res of
+        Exn.Res st' => ([], SOME st')
+      | Exn.Exn (Timeout.TIMEOUT _) =>
+          let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
+          in raise Eval_Timeout (l, line_content l) end
+      | Exn.Exn (Runtime.EXCURSION_FAIL (exn, _)) =>
+          (Runtime.exn_messages exn, NONE)
+      | Exn.Exn exn => (Runtime.exn_messages exn, NONE))
+    end;
 
   fun report_errors report_line errs =
     List.app (fn ((_, msg), _) =>
       writeln ("Error at line " ^ Int.toString report_line ^
                " (" ^ line_content report_line ^ "): " ^ msg)) errs;
 
-  (* Run one transition.  command_errors collects messages without raising and
-     yields NONE on failure, so we report every error and continue from the
-     previous state.  State mode therefore reports ALL errors up to the target
-     line instead of stopping at the first.  (Injection mode keeps fast-fail.) *)
+  (* Run one transition, collecting ordinary failures but allowing a timeout
+     interrupt to escape.  On an ordinary failure we report the errors and
+     continue from the previous state, so state mode reports ALL errors up to
+     the target line instead of stopping at the first. *)
   (* Capture warning/legacy messages emitted while a transition runs and re-emit
      them attributed to that transition's line (we process one transition at a
      time, so the attribution is exact).  Replaces the unattributed "### msg"
@@ -241,7 +255,7 @@ let
 
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default [];
+  val options = Options.default ();
   val _ = eval_at_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
@@ -275,7 +289,7 @@ let
       val start = Timing.start ();
       val res =
         (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-           (fn () => Toplevel.command_exception tr st) ()
+           (fn () => Toplevel.command_exception true tr st) ()
          handle Timeout.TIMEOUT _ =>
            let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
            in
@@ -488,7 +502,7 @@ end;
       File.write(script_path, script_content)
 
       /* start bash_process server for external tool invocation */
-      val server = Bash.Server.start(Logger.none)
+      val server = Bash.Server.start()
 
       val store = Store(options)
       val qd_options = options + "quick_and_dirty" +
@@ -499,13 +513,41 @@ end;
       val session_heaps =
         store.session_heaps(session_background, logic = effective_logic)
 
-      val (_, process) =
+      val process =
         ML_Process(qd_options, session_background, session_heaps,
           args = List("--use", File.platform_path(script_path)),
           cwd = thy_dir,
           redirect = false)
 
-      val result = try { process.result() } finally { server.stop() }
+      /* overall wall-clock watchdog: hard-terminate the ML process group if the
+         run exceeds the safety bound.  This bounds hangs the per-command timeout
+         cannot preempt (e.g. session-heap loading or GC/swap thrash), which would
+         otherwise leave an orphaned multi-GB poly process behind.  It is a
+         machine-protection safeguard, not a tunable: default 900s (15 min),
+         overridable only via ISABELLE_CLI_TOOLS_WALL_TIMEOUT (tests / rare huge
+         heaps; 0 disables). */
+      val wall_timeout =
+        sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
+          case Some(s) if s.nonEmpty => Value.Int.parse(s)
+          case _ => 900
+        }
+      val timed_out = Synchronized(false)
+      val watchdog =
+        if (wall_timeout > 0)
+          Some(Future.thread("eval_at_watchdog") {
+            Time.seconds(wall_timeout.toDouble).sleep()
+            timed_out.change(_ => true)
+            process.terminate()
+          })
+        else None
+
+      val result =
+        try process.result(strict = false)
+        finally { watchdog.foreach(_.cancel()); server.stop() }
+
+      if (timed_out.value)
+        progress.echo("eval_at: wall-clock timeout after " + wall_timeout +
+          "s; ML process terminated to avoid an orphaned session.")
 
       /* extract output between sentinels */
 
