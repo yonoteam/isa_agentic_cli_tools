@@ -21,6 +21,12 @@ A per-command timeout (-t SECS, default 60, 0 disables) aborts evaluation
 and reports the offending line if any transition exceeds the limit.
 Optional timing information (-T) can be reported for each processed command.
 
+Phase progress and diagnostics are streamed to stderr; command/proof results
+go to stdout.  After 15 seconds of visible silence a sparse heartbeat reports
+the latest replay position.  Fatal timeout/process outcomes exit nonzero,
+whereas ordinary state-mode replay errors remain diagnostic and are all
+reported.
+
 An overall wall-clock safeguard hard-terminates the spawned ML process group if
 the whole run exceeds a bound (default 900s; override via the env var
 ISABELLE_CLI_TOOLS_WALL_TIMEOUT, 0 disables).  Unlike -t, this also bounds hangs
@@ -481,6 +487,10 @@ Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
 
   The logic session is derived automatically from the theory's imports.
   Sibling imports in the same directory are loaded automatically.
+  Progress and diagnostics are written to stderr; command/proof results
+  are written to stdout. A heartbeat appears after 15 seconds of silence.
+  Fatal timeout and process failures exit nonzero. In state mode, ordinary
+  replay errors remain diagnostic and evaluation continues.
 
   COMMAND is any valid Isabelle outer-syntax command text.
 

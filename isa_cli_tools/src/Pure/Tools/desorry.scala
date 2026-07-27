@@ -19,6 +19,13 @@ The ML script is split into two phases:
     structures only exist in the theory-local ML namespace.)
 Communication between phases uses refs in a global ML structure.
 
+Replay stops at the first ordinary error, before proof search or mutation.
+Explicit -L targets must be unique, positive, in range, reachable before the
+optional stop line, and parsed sorry transitions.  Phase progress and
+diagnostics are streamed to stderr; proof results go to stdout.  After 15
+seconds of visible silence a sparse heartbeat reports the latest replay or
+proof-search position.  Fatal outcomes exit nonzero.
+
 An overall wall-clock safeguard hard-terminates the spawned ML process group if
 the whole run exceeds a bound (default 900s; override via the env var
 ISABELLE_CLI_TOOLS_WALL_TIMEOUT, 0 disables).  This bounds hangs the per-command
@@ -538,7 +545,8 @@ end;
 Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   Options are:
-    -L LINES     comma-separated list of line numbers to target (e.g., 42,105)
+    -L LINES     unique, positive lines of parsed, reachable sorry commands
+                 (comma-separated, e.g., 42,105)
     -d DIR       include session directory for import resolution
     -l NAME      logic session name (override automatic derivation)
     -o OPTION    override Isabelle system option
@@ -553,6 +561,9 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   The logic session is derived automatically from the theory's imports.
   Sibling imports in the same directory are loaded automatically.
+  Progress and diagnostics are written to stderr; proof results are written
+  to stdout. A heartbeat appears after 15 seconds of silence. Replay and
+  target-validation failures exit nonzero and write nothing.
   Each replayed command is bounded by -t seconds; if a tactic exceeds it
   (e.g. a non-terminating proof) desorry stops, reports the line, and writes
   nothing.

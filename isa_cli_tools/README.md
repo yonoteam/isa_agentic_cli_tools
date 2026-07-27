@@ -51,15 +51,17 @@ Isabelle installation root (the directory containing `bin/isabelle`).
 **Step 1.** Copy the Scala source files:
 
 ```bash
+cp src/Pure/Tools/cli_tool_common.scala $ISA/src/Pure/Tools/
 cp src/Pure/Tools/eval_at.scala  $ISA/src/Pure/Tools/
 cp src/Pure/Tools/desorry.scala  $ISA/src/Pure/Tools/
 ```
 
 **Step 2.** Register the source files in `$ISA/etc/build.props`.
 Find the alphabetically sorted list of `src/Pure/Tools/*.scala` entries
-and add two lines (maintaining alphabetical order):
+and add three lines (maintaining alphabetical order):
 
 ```
+  src/Pure/Tools/cli_tool_common.scala \
   src/Pure/Tools/desorry.scala \
   src/Pure/Tools/eval_at.scala \
 ```
@@ -68,6 +70,7 @@ For example, they go right before the `flarum.scala` entry:
 
 ```
   ...
+  src/Pure/Tools/cli_tool_common.scala \
   src/Pure/Tools/desorry.scala \
   src/Pure/Tools/eval_at.scala \
   src/Pure/Tools/flarum.scala \
@@ -105,6 +108,7 @@ If the tools were previously installed and you only need to pick up
 source changes, you can skip the registration steps:
 
 ```bash
+cp src/Pure/Tools/cli_tool_common.scala $ISA/src/Pure/Tools/
 cp src/Pure/Tools/eval_at.scala  $ISA/src/Pure/Tools/
 cp src/Pure/Tools/desorry.scala  $ISA/src/Pure/Tools/
 $ISA/bin/isabelle scala_build
@@ -536,6 +540,35 @@ tests) it can be overridden via the environment variable
 ISABELLE_CLI_TOOLS_WALL_TIMEOUT=3600 isabelle eval_at Big.thy 200
 ```
 
+### Live progress, heartbeats, and output streams
+
+Both tools print an immediate phase update while preparing the theory and
+checking the session heap, another when starting ML, and a replay update with
+the actual number of Isabelle transitions to process. Transition counts are
+not source-line counts.
+
+If 15 seconds pass without any visible result, warning, or phase update, the
+tool prints one heartbeat with its latest position. Further heartbeats remain
+limited to one per 15 seconds of silence:
+
+```text
+desorry: preparing theory and checking session heap...
+desorry: starting ML process...
+desorry: replaying 12,016 transitions...
+desorry: still working: replay 5,000/12,016 transitions (15s without output)
+```
+
+Internal position markers are consumed by the Scala runner and do not produce
+a line every few hundred transitions. Normal command and proof results go to
+stdout; progress, heartbeats, warnings, and fatal diagnostics go to stderr.
+This lets an agent poll a long-running command without either mistaking silence
+for a hang or receiving thousands of progress lines.
+
+Fatal replay, timeout, malformed-event, ML-process, and watchdog outcomes exit
+nonzero. Ordinary replay errors in `eval_at` state mode remain diagnostic:
+they are all reported on stderr, evaluation continues from the previous state,
+and the command exits successfully unless a fatal condition occurs.
+
 ### Prior commands and errors
 
 `eval_at` replays every Isabelle command from the top of the theory file down to
@@ -582,14 +615,17 @@ found proofs substituted for the corresponding `sorry`s.
 
 | Option | Description |
 |--------|-------------|
-| `-L LINES` | Comma-separated list of line numbers to target (e.g., `42,105`) |
+| `-L LINES` | Unique, positive lines of parsed, reachable `sorry` transitions (e.g., `42,105`) |
 | `-d DIR` | Add session directory for import resolution (repeatable) |
 | `-l NAME` | Override automatically derived logic session |
 | `-o OPT` | Override Isabelle system option |
 | `-t SECS` | Per-command timeout for replayed transitions (default: 60; 0 disables) |
 | `-v` | Verbose |
 
-Sledgehammer is run at a fixed timeout of 50 seconds per sorry (not configurable).
+Sledgehammer is requested with a fixed timeout of 50 seconds per `sorry` (not
+configurable). This is not a strict 50-second end-to-end wall deadline:
+individual prover slices and cleanup can run longer. The overall 900-second
+watchdog remains the hard bound for the complete ML process.
 
 ### Examples
 
@@ -614,7 +650,10 @@ isabelle desorry -l HOL-Analysis Foo.thy
 
 1. **Phase 1 (sequential):** Replays all transitions from the theory
    header, collecting the proof state at each `sorry` position. If the `-L`
-   flag is used, only `sorry` commands at the specified lines are collected.
+   flag is used, every requested line is checked before proof search: values
+   must be unique, positive, within the file, before the optional stop line,
+   and the starting line of a parsed `sorry` transition. `desorry` aborts on
+   the first ordinary replay error.
 2. **Phase 2 (parallel):** Runs Sledgehammer concurrently on all
    collected proof states.
 3. **Output:** Overwrites `THY_FILE` in-place with each processed `sorry`
@@ -642,6 +681,15 @@ desorry run. To revert, simply copy the backup back:
 ```bash
 cp Foo.thy.backup Foo.thy
 ```
+
+Replay, target-validation, timeout, and proof-search startup failures occur
+before the mutation branch: `desorry` exits nonzero, leaves the theory
+unchanged, and creates no backup.
+
+`desorry` validates the target theory and its imports, but it does **not**
+rebuild or validate sessions that reverse-depend on the edited theory. Run the
+appropriate session build separately when downstream compatibility is
+required.
 
 ### Technical note
 
