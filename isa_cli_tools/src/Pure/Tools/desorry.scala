@@ -18,6 +18,14 @@ The ML script is split into two phases:
     are accessible.  (After Pure.thy sets ML_write_global = false, HOL
     structures only exist in the theory-local ML namespace.)
 Communication between phases uses refs in a global ML structure.
+
+An overall wall-clock safeguard hard-terminates the spawned ML process group if
+the whole run exceeds a bound (default 900s; override via the env var
+ISABELLE_CLI_TOOLS_WALL_TIMEOUT, 0 disables).  This bounds hangs the per-command
+and Sledgehammer timeouts cannot preempt (e.g. session-heap loading, GC/swap
+thrash) that would otherwise leave an orphaned multi-GB poly process behind; the
+file is left unchanged if the safeguard fires.  It is a machine-protection
+safeguard, deliberately not a per-call flag.
 */
 
 package isabelle
@@ -255,14 +263,13 @@ let
                     Runtime.exn_message exn); st))
     end;
 
-  val master_dir = Path.dir (File.absolute_path thy_file);
+  val master_dir = Path.dir (Path.absolute thy_file);
   val header = Thy_Header.read Position.none original;
-  val options = Options.default [];
 
   val _ = desorry_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
-      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
+      else (Thy_Info.use_theories "" [((imp, Position.none), [])]; ())
     ) (#imports header)) ();
 
   fun mk_thy () =
@@ -547,8 +554,34 @@ end;
           cwd = thy_dir,
           redirect = false)
 
+      /* overall wall-clock watchdog: hard-terminate the ML process group if the
+         run exceeds the safety bound, so a hang the per-command / Sledgehammer
+         timeouts cannot preempt (e.g. session-heap loading or GC/swap thrash)
+         cannot leave an orphaned multi-GB poly process behind.  Machine-protection
+         safeguard, not a tunable: default 900s (15 min), overridable only via
+         ISABELLE_CLI_TOOLS_WALL_TIMEOUT (tests / rare huge heaps; 0 disables). */
+      val wall_timeout =
+        sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
+          case Some(s) if s.nonEmpty => Value.Int.parse(s)
+          case _ => 900
+        }
+      val timed_out = Synchronized(false)
+      val watchdog =
+        if (wall_timeout > 0)
+          Some(Future.thread("desorry_watchdog") {
+            Time.seconds(wall_timeout.toDouble).sleep()
+            timed_out.change(_ => true)
+            process.terminate()
+          })
+        else None
+
       val result =
-        try { process.result() } finally { server.stop() }
+        try process.result(strict = false)
+        finally { watchdog.foreach(_.cancel()); server.stop() }
+
+      if (timed_out.value)
+        progress.echo("desorry: wall-clock timeout after " + wall_timeout +
+          "s; ML process terminated to avoid an orphaned session (file left unchanged).")
 
 
       /* extract output between sentinels */
