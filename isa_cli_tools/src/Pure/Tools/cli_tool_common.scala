@@ -466,6 +466,15 @@ end;
       var process: Option[Bash.Process] = None
       var process_joined = false
 
+      def disarm_watchdog(): Unit = {
+        val active = watchdog
+        watchdog = None
+        active.foreach { thread =>
+          thread.cancel()
+          thread.join_result
+        }
+      }
+
       try {
         val store = Store(options)
         val qd_options =
@@ -529,6 +538,7 @@ end;
             progress_stderr = stderr,
             strict = false)
         process_joined = true
+        disarm_watchdog()
 
         if (result.rc != 0 && reporter.fatal_message.isEmpty) {
           reporter.fatal("ML process failed (return code " + result.rc + ").")
@@ -552,10 +562,7 @@ end;
         preliminary.copy(artifacts = artifacts)
       }
       finally {
-        watchdog.foreach { thread =>
-          thread.cancel()
-          thread.join_result
-        }
+        disarm_watchdog()
         if (!process_joined) process.foreach(_.terminate())
         server.stop()
       }
