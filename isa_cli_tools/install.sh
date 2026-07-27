@@ -48,18 +48,23 @@ echo "=== Installing eval_at + desorry into $ISABELLE_HOME ==="
 
 # ── Step 1: copy Scala sources ───────────────────────────────────────────
 echo ""
-echo "Step 1/6: Copying eval_at.scala..."
+echo "Step 1/7: Copying cli_tool_common.scala..."
+cp "$SCRIPT_DIR/src/Pure/Tools/cli_tool_common.scala" "$ISABELLE_HOME/src/Pure/Tools/cli_tool_common.scala"
+echo "  -> $ISABELLE_HOME/src/Pure/Tools/cli_tool_common.scala"
+
+echo ""
+echo "Step 2/7: Copying eval_at.scala..."
 cp "$SCRIPT_DIR/src/Pure/Tools/eval_at.scala" "$ISABELLE_HOME/src/Pure/Tools/eval_at.scala"
 echo "  -> $ISABELLE_HOME/src/Pure/Tools/eval_at.scala"
 
 echo ""
-echo "Step 2/6: Copying desorry.scala..."
+echo "Step 3/7: Copying desorry.scala..."
 cp "$SCRIPT_DIR/src/Pure/Tools/desorry.scala" "$ISABELLE_HOME/src/Pure/Tools/desorry.scala"
 echo "  -> $ISABELLE_HOME/src/Pure/Tools/desorry.scala"
 
 # ── Step 2: register sources in build.props ──────────────────────────────
 echo ""
-echo "Step 3/6: Registering sources in etc/build.props..."
+echo "Step 4/7: Registering sources in etc/build.props..."
 
 if grep -qF "eval_at.scala" "$BUILD_PROPS" && [ "$FORCE" = false ]; then
   echo "  eval_at.scala (already present, skipping — use -f to force)"
@@ -94,9 +99,26 @@ else
   fi
 fi
 
+if grep -qF "cli_tool_common.scala" "$BUILD_PROPS" && [ "$FORCE" = false ]; then
+  echo "  cli_tool_common.scala (already present, skipping — use -f to force)"
+else
+  # Remove existing entry first (if any) to avoid duplicates
+  sed -i.bak '/src\/Pure\/Tools\/cli_tool_common\.scala/d' "$BUILD_PROPS"
+  # Insert alphabetically before desorry.scala
+  sed -i.bak \
+    's|  src/Pure/Tools/desorry\.scala \\|  src/Pure/Tools/cli_tool_common.scala \\\n  src/Pure/Tools/desorry.scala \\|' \
+    "$BUILD_PROPS"
+  if grep -qF "cli_tool_common.scala" "$BUILD_PROPS"; then
+    echo "  cli_tool_common.scala -> added before desorry.scala"
+  else
+    echo "ERROR: Could not insert cli_tool_common.scala into build.props." >&2
+    exit 1
+  fi
+fi
+
 # ── Step 3: register tools in isabelle_tool.scala ────────────────────────
 echo ""
-echo "Step 4/6: Registering tools in isabelle_tool.scala..."
+echo "Step 5/7: Registering tools in isabelle_tool.scala..."
 
 if grep -qF "Eval_At" "$TOOL_SCALA" && [ "$FORCE" = false ]; then
   echo "  Eval_At (already present, skipping — use -f to force)"
@@ -133,12 +155,12 @@ fi
 
 # ── Step 4: rebuild ──────────────────────────────────────────────────────
 echo ""
-echo "Step 5/6: Rebuilding Isabelle/Scala (this takes a moment)..."
+echo "Step 6/7: Rebuilding Isabelle/Scala (this takes a moment)..."
 "$ISABELLE_HOME/bin/isabelle" scala_build
 
 # ── Step 5: verify ───────────────────────────────────────────────────────
 echo ""
-echo "Step 6/6: Verifying installation..."
+echo "Step 7/7: Verifying installation..."
 # Invoke with no args: registered tools print usage (rc=1), unregistered tools
 # print "Unknown Isabelle tool" (rc=2).  Check the output for "Usage:".
 # Use a subshell to avoid pipefail propagating the non-zero rc from the tool.

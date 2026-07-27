@@ -48,29 +48,6 @@ object Desorry {
 
   private val sledgehammer_timeout = 50
 
-  private val ml_local_protocol_handlers =
-    """
-fun desorry_with_local_protocol_handlers f x =
-  let
-    val old_protocol_message_fn = ! Private_Output.protocol_message_fn;
-
-    fun local_protocol_message props _ =
-      if Properties.get props "function" = SOME "invoke_scala" andalso
-         Properties.get props Markup.nameN = SOME "bibtex_session_entries"
-      then
-        (case Properties.get props Markup.idN of
-          SOME id =>
-            Protocol_Command.run "Scala.result"
-              [Bytes.string id, Bytes.string "1"]
-        | NONE => ())
-      else old_protocol_message_fn props [];
-  in
-    Unsynchronized.setmp Private_Output.protocol_message_fn
-      local_protocol_message f x
-  end;
-"""
-
-
   /** Phase 2 ML script: Sledgehammer invocation (evaluated within theory context) **/
 
   private def ml_script_phase2(): String =
@@ -223,7 +200,7 @@ end;
     val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
-${ml_local_protocol_handlers}
+${Cli_Tool_Common.ml_protocol_handlers}
 
 structure Desorry_Comm = struct
   val sorry_states : (int * Proof.state) list Unsynchronized.ref = Unsynchronized.ref [];
@@ -266,7 +243,7 @@ let
   val master_dir = Path.dir (Path.absolute thy_file);
   val header = Thy_Header.read Position.none original;
 
-  val _ = desorry_with_local_protocol_handlers (fn () =>
+  val _ = cli_tool_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
       else (Thy_Info.use_theories "" [((imp, Position.none), [])]; ())
@@ -381,81 +358,6 @@ end;
   }
 
 
-  /** derive logic session from theory imports **/
-
-  private def derive_logic(
-    options: Options,
-    thy_file: Path,
-    dirs: List[Path]
-  ): String = {
-    try {
-      val node_name = Document.Node.Name(thy_file.absolute.implode,
-        theory = Thy_Header.get_thy_name(
-          thy_file.base.implode).getOrElse(""))
-      val header = Thy_Header.read(node_name,
-        Scan.char_reader(File.read(thy_file)),
-        command = false, strict = false)
-
-      val theory_names =
-        header.imports.map { case (s, _) => Thy_Header.import_name(s) }
-      if (theory_names.isEmpty)
-        return Isabelle_System.default_logic()
-
-      val sessions_structure =
-        Sessions.load_structure(options, dirs = dirs)
-
-      val session_candidates = theory_names.flatMap { name =>
-        val qualifier = sessions_structure.theory_qualifier(name)
-        if (qualifier.nonEmpty && sessions_structure.defined(qualifier))
-          Some(qualifier)
-        else None
-      }.distinct
-
-      if (session_candidates.isEmpty) Isabelle_System.default_logic()
-      else {
-        val graph = sessions_structure.imports_graph
-        session_candidates.maxBy { s =>
-          try { graph.all_preds(List(s)).size }
-          catch { case _: Graph.Undefined[_] => 0 }
-        }
-      }
-    }
-    catch {
-      case ERROR(_) => Isabelle_System.default_logic()
-    }
-  }
-
-
-  /** check logic session without building heaps **/
-
-  private def check_logic_heap(
-    options: Options,
-    logic: String,
-    dirs: List[Path],
-    progress: Progress
-  ): Unit = {
-    val results =
-      Build.build(options,
-        selection = Sessions.Selection.session(logic),
-        progress = progress,
-        build_heap = true,
-        no_build = true,
-        dirs = dirs)
-
-    if (!results.ok) {
-      error("Session heap for " + quote(logic) + " is not available or not up to date; " +
-        "refusing to build it automatically.\n\n" +
-        "How to run this safely:\n" +
-        "  1. Choose a session whose heap is already built.\n" +
-        "  2. If the theory belongs to an unbuilt session, use that session's built parent " +
-        "with -l and pass -d for the directory containing the ROOT file.\n" +
-        "  3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]\n\n" +
-        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
-        "  isabelle desorry -l HOL-Computational_Algebra -d $ISABELLE_HOME/src/HOL FILE.thy")
-    }
-  }
-
-
   /** desorry **/
 
   def desorry(
@@ -470,56 +372,20 @@ end;
     progress: Progress = new Progress
   ): Unit = {
 
-    /* read theory content */
+    val prepared =
+      Cli_Tool_Common.prepare_theory(options, thy_file, logic, dirs)
 
-    val content = File.read(thy_file)
-    val file_lines = split_lines(content)
-
-    Thy_Header.get_thy_name(thy_file.base.implode)
-      .getOrElse(error(
-        "Cannot determine theory name from " + thy_file))
-
-
-    /* parse header and resolve path-based imports */
-
-    val thy_dir = thy_file.absolute.dir
-
-    val node_name = Document.Node.Name(thy_file.absolute.implode,
-      theory = Thy_Header.get_thy_name(
-        thy_file.base.implode).getOrElse(""))
-    val header = Thy_Header.read(node_name,
-      Scan.char_reader(content), command = false, strict = false)
-
-    val import_dirs: List[Path] = header.imports.flatMap {
-      case (s, _) =>
-        try {
-          val raw = Path.explode(s)
-          if (raw.implode.contains("/")) {
-            val import_dir =
-              if (raw.is_absolute) raw.dir.absolute
-              else (thy_dir + raw).dir.absolute
-            if (import_dir.is_dir) Some(import_dir) else None
-          }
-          else None
-        }
-        catch { case ERROR(_) => None }
-    }.distinct
-
-    val all_dirs = (dirs ::: import_dirs).distinct
-
-
-    /* determine the logic session */
-
-    val effective_logic =
-      if (logic.nonEmpty) logic
-      else derive_logic(options, thy_file, all_dirs)
-
-    progress.echo_if(verbose, "Logic session: " + effective_logic)
-
+    progress.echo_if(verbose, "Logic session: " + prepared.logic)
 
     /* ensure logic heap is available without building */
 
-    check_logic_heap(options, effective_logic, all_dirs, progress)
+    Cli_Tool_Common.check_logic_heap(
+      options,
+      prepared,
+      progress,
+      "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
+        "  isabelle desorry -l HOL-Computational_Algebra -d " +
+        "$ISABELLE_HOME/src/HOL FILE.thy")
 
 
     /* run the ML scripts via ML_Process */
@@ -542,16 +408,16 @@ end;
         ("bash_process_address=" + server.address) +
         ("bash_process_password=" + server.password)
       val session_background =
-        Sessions.background(qd_options, effective_logic,
-          dirs = all_dirs).check_errors
+        Sessions.background(
+          qd_options, prepared.logic, dirs = prepared.dirs).check_errors
       val session_heaps =
         store.session_heaps(session_background,
-          logic = effective_logic)
+          logic = prepared.logic)
 
       val (_, process) =
         ML_Process(qd_options, session_background, session_heaps,
           args = List("--use", File.platform_path(script_path)),
-          cwd = thy_dir,
+          cwd = prepared.thy_dir,
           redirect = false)
 
       /* overall wall-clock watchdog: hard-terminate the ML process group if the
