@@ -36,11 +36,6 @@ import scala.collection.mutable
 
 object Eval_At {
 
-  /** sentinel markers for extracting output from ML stdout **/
-
-  private val sentinel_start = "===EVAL_AT_BEGIN==="
-  private val sentinel_end   = "===EVAL_AT_END==="
-
   /** generate ML script: state mode (no command injection) **/
 
   private def ml_script_state(thy_file: Path, line: Int, timing: Boolean, cmd_timeout: Int): String = {
@@ -48,11 +43,10 @@ object Eval_At {
     val line_ml = ML_Syntax.print_int(line)
     val timing_ml = if (timing) "true" else "false"
     val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
-    val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
-    val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
 ${Cli_Tool_Common.ml_protocol_handlers}
+${Cli_Tool_Common.ml_event_protocol}
 
 exception Eval_Timeout of int * string;
 
@@ -100,6 +94,24 @@ let
             | NONE => split rest (tr :: bef) ats))
     in split transitions [] [] end;
 
+  val replay_trs = before_trs @ at_trs;
+  val total = length (filter_out Toplevel.is_ignored replay_trs);
+  val completed = Unsynchronized.ref 0;
+  val _ = CLI_Tool_Event.status "replay" (SOME 0) (SOME total) NONE NONE;
+
+  fun note_progress tr =
+    if Toplevel.is_ignored tr then ()
+    else
+      let
+        val current = ! completed + 1;
+        val _ = completed := current;
+      in
+        if current mod 250 = 0 orelse current = total
+        then CLI_Tool_Event.status "replay"
+          (SOME current) (SOME total) NONE NONE
+        else ()
+      end;
+
   fun exec_errors tr st =
     let
       val start = Timing.start ();
@@ -112,7 +124,9 @@ let
                 let
                   val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
                   val name = Toplevel.name_of tr
-                in writeln ("Timing line " ^ Int.toString l ^ " (" ^ name ^ "): " ^ Timing.message t) end
+                in CLI_Tool_Event.result
+                  ("Timing line " ^ Int.toString l ^ " (" ^ name ^ "): " ^
+                   Timing.message t) end
               else ();
     in
       (case res of
@@ -127,8 +141,9 @@ let
 
   fun report_errors report_line errs =
     List.app (fn ((_, msg), _) =>
-      writeln ("Error at line " ^ Int.toString report_line ^
-               " (" ^ line_content report_line ^ "): " ^ msg)) errs;
+      CLI_Tool_Event.warning
+        ("Error at line " ^ Int.toString report_line ^
+         " (" ^ line_content report_line ^ "): " ^ msg)) errs;
 
   (* Run one transition, collecting ordinary failures but allowing a timeout
      interrupt to escape.  On an ordinary failure we report the errors and
@@ -147,15 +162,16 @@ let
           (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture
              (fn () => exec_errors tr st) ()) ();
       val _ = List.app (fn msg =>
-        writeln ("Warning at line " ^ Int.toString report_line ^
-                 " (" ^ line_content report_line ^ "): " ^ msg)) (rev (! warn_buf));
+        CLI_Tool_Event.warning
+          ("Warning at line " ^ Int.toString report_line ^
+           " (" ^ line_content report_line ^ "): " ^ msg)) (rev (! warn_buf));
+      val _ = note_progress tr;
     in
       (case st_opt of
         SOME st' => st'
       | NONE => (report_errors report_line errs; st))
     end;
 
-  val () = writeln ${sentinel_start_ml};
   val () =
     (let
        val pre_st = fold (fn tr => fn st =>
@@ -169,15 +185,16 @@ let
        val ps_output = Toplevel.pretty_state final_st;
        val _ =
          if null ps_output then
-           (if null at_trs then writeln "No proof state." else ())
+           (if null at_trs then CLI_Tool_Event.result "No proof state." else ())
          else
-           List.app (fn p => writeln (Pretty.string_of p)) ps_output;
+           List.app (CLI_Tool_Event.result o Pretty.string_of) ps_output;
      in () end)
     handle Eval_Timeout (line, content) =>
-      writeln ("eval_at: timed out after " ^ Int.toString cmd_timeout ^
-               "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
+      CLI_Tool_Event.fatal
+        ("timed out after " ^ Int.toString cmd_timeout ^
+         "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
 in
-  writeln ${sentinel_end_ml}
+  ()
 end;
 """
   }
@@ -194,11 +211,10 @@ end;
     val show_state_ml = if (show_state) "true" else "false"
     val timing_ml = if (timing) "true" else "false"
     val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
-    val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
-    val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
 
     s"""
 ${Cli_Tool_Common.ml_protocol_handlers}
+${Cli_Tool_Common.ml_event_protocol}
 
 exception Eval_Timeout of int * string;
 
@@ -259,6 +275,24 @@ let
             | NONE => split rest (tr :: pre))
     in split transitions [] end;
 
+  val replay_trs = pre_trs @ inj_trs;
+  val total = length (filter_out Toplevel.is_ignored replay_trs);
+  val completed = Unsynchronized.ref 0;
+  val _ = CLI_Tool_Event.status "replay" (SOME 0) (SOME total) NONE NONE;
+
+  fun note_progress tr =
+    if Toplevel.is_ignored tr then ()
+    else
+      let
+        val current = ! completed + 1;
+        val _ = completed := current;
+      in
+        if current mod 250 = 0 orelse current = total
+        then CLI_Tool_Event.status "replay"
+          (SOME current) (SOME total) NONE NONE
+        else ()
+      end;
+
   fun exec_timing tr st =
     let
       val start = Timing.start ();
@@ -277,11 +311,13 @@ let
                 let
                   val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
                   val name = Toplevel.name_of tr
-                in writeln ("Timing line " ^ Int.toString l ^ " (" ^ name ^ "): " ^ Timing.message t) end
+                in CLI_Tool_Event.result
+                  ("Timing line " ^ Int.toString l ^ " (" ^ name ^ "): " ^
+                   Timing.message t) end
               else ();
+      val _ = note_progress tr;
     in res end;
 
-  val () = writeln ${sentinel_start_ml};
   val () =
     (let
        val pre_st = fold (fn tr => fn st =>
@@ -292,9 +328,10 @@ let
              val line_opt = Position.line_of (Toplevel.pos_of tr);
              val fail_line = (case line_opt of SOME l => l | NONE => 0);
            in
-             writeln ("Error before injection at line " ^ Int.toString fail_line ^
-                      " (" ^ line_content fail_line ^ "): " ^ Runtime.exn_message exn);
-             writeln ${sentinel_end_ml};
+             CLI_Tool_Event.fatal
+               ("Error before injection at line " ^ Int.toString fail_line ^
+                " (" ^ line_content fail_line ^ "): " ^
+                Runtime.exn_message exn);
              Exn.reraise exn
            end
        ) pre_trs (Toplevel.make_state NONE);
@@ -305,23 +342,26 @@ let
            (exec_timing tr st, false)
            handle Eval_Timeout e => raise Eval_Timeout e
                 | exn =>
-             (writeln ("Error at line " ^ Int.toString inject_line ^
-                       " (" ^ line_content_inj ^ "): " ^ Runtime.exn_message exn);
+             (CLI_Tool_Event.warning
+                ("Error at line " ^ Int.toString inject_line ^
+                 " (" ^ line_content_inj ^ "): " ^
+                 Runtime.exn_message exn);
               (st, true))
        ) inj_trs (pre_st, false);
 
        val _ = if show_state then
          let val output = Toplevel.pretty_state post_st in
-           if null output then writeln "No proof state."
-           else List.app (fn p => writeln (Pretty.string_of p)) output
+           if null output then CLI_Tool_Event.result "No proof state."
+           else List.app (CLI_Tool_Event.result o Pretty.string_of) output
          end
        else ();
      in () end)
     handle Eval_Timeout (line, content) =>
-      writeln ("eval_at: timed out after " ^ Int.toString cmd_timeout ^
-               "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
+      CLI_Tool_Event.fatal
+        ("timed out after " ^ Int.toString cmd_timeout ^
+         "s at line " ^ Int.toString line ^ " (" ^ content ^ ").");
 in
-  writeln ${sentinel_end_ml}
+  ()
 end;
 """
   }
@@ -342,122 +382,61 @@ end;
     cmd_timeout: Int = 60,
     verbose: Boolean = false,
     progress: Progress = new Progress
-  ): Unit = {
+  ): Int = {
+    def recode(s: String): String = Symbol.output(unicode_symbols, s)
 
-    val prepared =
-      Cli_Tool_Common.prepare_theory(options, thy_file, logic, dirs)
-    val file_lines = prepared.file_lines
+    Cli_Tool_Common.with_reporter("eval_at", verbose, recode) { reporter =>
+      reporter.phase(
+        "preparing theory and checking session heap...",
+        Cli_Tool_Common.Status(phase = "preflight"))
 
-    if (line < 1 || line > file_lines.length)
-      error("Line " + line + " out of range (file has " + file_lines.length + " lines)")
+      val prepared =
+        Cli_Tool_Common.prepare_theory(options, thy_file, logic, dirs)
+      val file_lines = prepared.file_lines
 
-    progress.echo_if(verbose, "Logic session: " + prepared.logic)
+      if (line < 1 || line > file_lines.length)
+        error(
+          "Line " + line + " out of range (file has " +
+            file_lines.length + " lines)")
 
+      reporter.diagnostic_if_verbose("Logic session: " + prepared.logic)
+      Cli_Tool_Common.check_logic_heap(
+        options,
+        prepared,
+        progress,
+        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
+          "  isabelle eval_at -l HOL-Computational_Algebra -d " +
+          "$ISABELLE_HOME/src/HOL FILE.thy LINE")
 
-    /* ensure logic heap is available without building */
-
-    Cli_Tool_Common.check_logic_heap(
-      options,
-      prepared,
-      progress,
-      "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
-        "  isabelle eval_at -l HOL-Computational_Algebra -d " +
-        "$ISABELLE_HOME/src/HOL FILE.thy LINE")
-
-
-    /* run the ML script via ML_Process */
-
-    Isabelle_System.with_tmp_dir("eval_at") { tmp_dir =>
+      reporter.phase(
+        "starting ML process...",
+        Cli_Tool_Common.Status(phase = "startup"))
 
       val inject_mode = command.nonEmpty
-      val script_content =
-        if (inject_mode) ml_script_inject(thy_file, line, command, show_state, timing, cmd_timeout)
-        else ml_script_state(thy_file, line, timing, cmd_timeout)
-      val script_path = tmp_dir + Path.explode("eval_at.ML")
-      File.write(script_path, script_content)
-
-      /* start bash_process server for external tool invocation */
-      val server = Bash.Server.start(Logger.none)
-
-      val store = Store(options)
-      val qd_options = options + "quick_and_dirty" +
-        ("bash_process_address=" + server.address) +
-        ("bash_process_password=" + server.password)
-      val session_background =
-        Sessions.background(
-          qd_options, prepared.logic, dirs = prepared.dirs).check_errors
-      val session_heaps =
-        store.session_heaps(session_background, logic = prepared.logic)
-
-      val (_, process) =
-        ML_Process(qd_options, session_background, session_heaps,
-          args = List("--use", File.platform_path(script_path)),
-          cwd = prepared.thy_dir,
-          redirect = false)
-
-      /* overall wall-clock watchdog: hard-terminate the ML process group if the
-         run exceeds the safety bound.  This bounds hangs the per-command timeout
-         cannot preempt (e.g. session-heap loading or GC/swap thrash), which would
-         otherwise leave an orphaned multi-GB poly process behind.  It is a
-         machine-protection safeguard, not a tunable: default 900s (15 min),
-         overridable only via ISABELLE_CLI_TOOLS_WALL_TIMEOUT (tests / rare huge
-         heaps; 0 disables). */
-      val wall_timeout =
-        sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
-          case Some(s) if s.nonEmpty => Value.Int.parse(s)
-          case _ => 900
+      val outcome =
+        Cli_Tool_Common.run_ml_process(options, prepared, reporter) { tmp_dir =>
+          val script_content =
+            if (inject_mode)
+              ml_script_inject(
+                thy_file, line, command, show_state, timing, cmd_timeout)
+            else ml_script_state(thy_file, line, timing, cmd_timeout)
+          val script_path = tmp_dir + Path.explode("eval_at.ML")
+          File.write(script_path, script_content)
+          script_path
         }
-      val timed_out = Synchronized(false)
-      val watchdog =
-        if (wall_timeout > 0)
-          Some(Future.thread("eval_at_watchdog") {
-            Time.seconds(wall_timeout.toDouble).sleep()
-            timed_out.change(_ => true)
-            process.terminate()
-          })
-        else None
 
-      val result =
-        try process.result(strict = false)
-        finally { watchdog.foreach(_.cancel()); server.stop() }
-
-      if (timed_out.value)
-        progress.echo("eval_at: wall-clock timeout after " + wall_timeout +
-          "s; ML process terminated to avoid an orphaned session.")
-
-      /* extract output between sentinels */
-
-      def recode(s: String): String = Symbol.output(unicode_symbols, s)
-
-      val all_lines = split_lines(result.out)
-      val output = all_lines
-        .dropWhile(_ != sentinel_start).drop(1)
-        .takeWhile(_ != sentinel_end)
-        .filter(s => s != "don't export proof")
-        .map(recode)
-
-      val line_content = if (line >= 1 && line <= file_lines.length) file_lines(line - 1) else ""
-
-      if (output.nonEmpty) {
-        output.foreach(s => progress.echo(s))
-      }
-      else if (result.rc != 0) {
-        progress.echo("eval_at: line " + line +
-          " (" + line_content + "): failed (return code " + result.rc + ")")
-        if (result.err.nonEmpty) progress.echo(result.err)
-        if (result.out.nonEmpty) progress.echo(result.out)
-      }
-      else if (inject_mode) {
-        progress.echo("eval_at: line " + line +
-          " (" + line_content + "): no command output was produced." +
-          " Use -s to show the resulting proof state.")
-      }
-      else {
-        progress.echo("No output at this line.")
+      if (outcome.exit_code == 0 && !reporter.has_results) {
+        val line_content = file_lines(line - 1)
+        if (inject_mode) {
+          reporter.result(
+            "eval_at: line " + line + " (" + line_content +
+              "): no command output was produced. " +
+              "Use -s to show the resulting proof state.")
+        }
+        else reporter.result("No output at this line.")
       }
 
-      if (verbose && result.err.nonEmpty)
-        progress.echo_warning(result.err)
+      outcome.exit_code
     }
   }
 
@@ -537,9 +516,11 @@ Usage: isabelle eval_at [OPTIONS] THY_FILE LINE [COMMAND]
 
       val progress = new Console_Progress(verbose = verbose)
 
-      eval_at(options, thy_file, line, command = command, logic = logic,
-        dirs = dirs.toList, unicode_symbols = unicode_symbols,
-        show_state = show_state, timing = timing, cmd_timeout = cmd_timeout,
-        verbose = verbose, progress = progress)
+      val rc =
+        eval_at(options, thy_file, line, command = command, logic = logic,
+          dirs = dirs.toList, unicode_symbols = unicode_symbols,
+          show_state = show_state, timing = timing, cmd_timeout = cmd_timeout,
+          verbose = verbose, progress = progress)
+      if (rc != 0) sys.exit(rc)
     })
 }

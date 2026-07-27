@@ -138,4 +138,381 @@ fun cli_tool_with_local_protocol_handlers f x =
           example)
     }
   }
+
+
+  /* structured ML events */
+
+  private val event_prefix = "@@ISABELLE_CLI_EVENT@@"
+
+  final case class Status(
+    phase: String = "starting",
+    current: Option[Int] = None,
+    total: Option[Int] = None,
+    completed: Option[Int] = None,
+    work_total: Option[Int] = None
+  )
+
+  sealed trait Event
+  final case class Status_Event(status: Status) extends Event
+  final case class Result_Event(message: String) extends Event
+  final case class Warning_Event(message: String) extends Event
+  final case class Fatal_Event(message: String) extends Event
+
+  val ml_event_protocol: String =
+    """
+structure CLI_Tool_Event = struct
+  val prefix = "@@ISABELLE_CLI_EVENT@@";
+
+  fun escape_char "\\" = "\\\\"
+    | escape_char "\t" = "\\t"
+    | escape_char "\r" = "\\r"
+    | escape_char "\n" = "\\n"
+    | escape_char c = c;
+
+  val escape = implode o map escape_char o raw_explode;
+  fun field (name, value) = name ^ "=" ^ escape value;
+  fun optional_int _ NONE = []
+    | optional_int name (SOME value) = [(name, Int.toString value)];
+
+  fun emit kind fields =
+    writeln (space_implode "\t" (prefix :: kind :: map field fields));
+
+  fun status phase current total completed work_total =
+    emit "STATUS"
+      ([("phase", phase)] @
+       optional_int "current" current @
+       optional_int "total" total @
+       optional_int "completed" completed @
+       optional_int "work_total" work_total);
+
+  fun result message = emit "RESULT" [("message", message)];
+  fun warning message = emit "WARNING" [("message", message)];
+  fun fatal message = emit "FATAL" [("message", message)];
+end;
+"""
+
+  private def malformed_event(message: String): Fatal_Event =
+    Fatal_Event("malformed CLI event: " + message)
+
+  private def unescape_event_value(value: String): String = {
+    val result = new StringBuilder
+    var index = 0
+    while (index < value.length) {
+      val c = value.charAt(index)
+      if (c != '\\') {
+        result.append(c)
+        index += 1
+      }
+      else {
+        if (index + 1 >= value.length) error("trailing escape")
+        value.charAt(index + 1) match {
+          case '\\' => result.append('\\')
+          case 't' => result.append('\t')
+          case 'r' => result.append('\r')
+          case 'n' => result.append('\n')
+          case other => error("unknown escape \\" + other)
+        }
+        index += 2
+      }
+    }
+    result.toString
+  }
+
+  private def decode_event(line: String): Option[Event] = {
+    if (!line.startsWith(event_prefix)) None
+    else {
+      Some(
+        try {
+          val parts = space_explode('\t', line)
+          if (parts.length < 2 || parts.head != event_prefix)
+            error("missing event kind")
+          val kind = parts(1)
+          val entries = parts.drop(2).map { entry =>
+            val equals = entry.indexOf('=')
+            if (equals <= 0) error("malformed property " + quote(entry))
+            val name = entry.substring(0, equals).nn
+            val value = unescape_event_value(entry.substring(equals + 1).nn)
+            name -> value
+          }
+          val duplicate_names =
+            entries.groupMapReduce(_._1)(_ => 1)(_ + _)
+              .collect { case (name, count) if count > 1 => name }.toList.sorted
+          if (duplicate_names.nonEmpty)
+            error("duplicate properties " + commas(duplicate_names))
+          val properties = entries.toMap
+
+          def require_only(allowed: Set[String]): Unit = {
+            val unknown = properties.keySet.diff(allowed).toList.sorted
+            if (unknown.nonEmpty) error("unknown properties " + commas(unknown))
+          }
+          def required(name: String): String =
+            properties.getOrElse(name, error("missing property " + quote(name)))
+          def optional_int(name: String): Option[Int] =
+            properties.get(name).map { text =>
+              val value = Value.Int.parse(text)
+              if (value < 0) error("negative counter " + quote(name))
+              value
+            }
+
+          kind match {
+            case "STATUS" =>
+              require_only(Set("phase", "current", "total", "completed", "work_total"))
+              Status_Event(
+                Status(
+                  phase = required("phase"),
+                  current = optional_int("current"),
+                  total = optional_int("total"),
+                  completed = optional_int("completed"),
+                  work_total = optional_int("work_total")))
+            case "RESULT" =>
+              require_only(Set("message"))
+              Result_Event(required("message"))
+            case "WARNING" =>
+              require_only(Set("message"))
+              Warning_Event(required("message"))
+            case "FATAL" =>
+              require_only(Set("message"))
+              Fatal_Event(required("message"))
+            case _ => error("unknown event kind " + quote(kind))
+          }
+        }
+        catch {
+          case ERROR(message) => malformed_event(message)
+          case exn: Throwable => malformed_event(Exn.message(exn))
+        })
+    }
+  }
+
+
+  /* live reporting */
+
+  private final case class Reporter_State(
+    status: Status,
+    last_visible: Time,
+    fatal_message: Option[String],
+    result_count: Int
+  )
+
+  final class Reporter private[Cli_Tool_Common](
+    tool_name: String,
+    verbose: Boolean,
+    recode: String => String
+  ) {
+    private val heartbeat_interval = Time.seconds(15)
+    private val state =
+      Synchronized(Reporter_State(Status(), Time.now(), None, 0))
+    private val output_lock = new AnyRef
+
+    private def format_count(value: Int): String =
+      value.toString.reverse.grouped(3).mkString(",").reverse
+
+    private def visible(message: String, stdout: Boolean = false): Unit =
+      output_lock.synchronized {
+        Output.writeln(recode(message), stdout = stdout)
+        state.change(st => st.copy(last_visible = Time.now()))
+      }
+
+    private def phase_message(status: Status): String =
+      status match {
+        case Status("replay", _, Some(total), _, _) =>
+          "replaying " + format_count(total) + " transitions..."
+        case Status("proof search", _, _, _, Some(total)) =>
+          "proving " + format_count(total) + " sorry(s)..."
+        case _ => status.phase + "..."
+      }
+
+    private def heartbeat_detail(status: Status): String =
+      status match {
+        case Status(phase, Some(current), Some(total), _, _) =>
+          phase + " " + format_count(current) + "/" + format_count(total) +
+            " transitions"
+        case Status(phase, _, _, Some(completed), Some(total)) =>
+          phase + " " + format_count(completed) + "/" + format_count(total) +
+            " goals"
+        case _ => status.phase
+      }
+
+    def phase(message: String, status: Status): Unit = {
+      state.change(st => st.copy(status = status))
+      visible(tool_name + ": " + message)
+    }
+
+    def update(status: Status): Unit = {
+      val previous =
+        state.change_result(st => (st.status, st.copy(status = status)))
+      if (previous.phase != status.phase)
+        visible(tool_name + ": " + phase_message(status))
+    }
+
+    def result(message: String): Unit = {
+      state.change(st => st.copy(result_count = st.result_count + 1))
+      visible(message, stdout = true)
+    }
+
+    def warning(message: String): Unit = visible(message)
+
+    def diagnostic(message: String): Unit = visible(message)
+
+    def diagnostic_if_verbose(message: String): Unit =
+      if (verbose && message.nonEmpty) diagnostic(message)
+
+    def fatal(message: String): Unit = {
+      val first =
+        state.change_result { st =>
+          val is_first = st.fatal_message.isEmpty
+          val next =
+            if (is_first) st.copy(fatal_message = Some(message))
+            else st
+          (is_first, next)
+        }
+      if (first) visible(tool_name + ": " + message)
+    }
+
+    def fatal_message: Option[String] = state.value.fatal_message
+
+    def has_results: Boolean = state.value.result_count > 0
+
+    def handle(event: Event): Unit =
+      event match {
+        case Status_Event(status) => update(status)
+        case Result_Event(message) => result(message)
+        case Warning_Event(message) => warning(message)
+        case Fatal_Event(message) => fatal(message)
+      }
+
+    private def maybe_heartbeat(): Unit = {
+      val snapshot = state.value
+      if (Time.now() - snapshot.last_visible >= heartbeat_interval) {
+        visible(
+          tool_name + ": still working: " + heartbeat_detail(snapshot.status) +
+            " (15s without output)")
+      }
+    }
+
+    def start_heartbeat(): Future[Unit] =
+      Future.thread(tool_name + "_heartbeat", daemon = true) {
+        while (true) {
+          Time.seconds(1).sleep()
+          maybe_heartbeat()
+        }
+      }
+
+    def stop_heartbeat(thread: Future[Unit]): Unit = {
+      thread.cancel()
+      thread.join_result
+    }
+  }
+
+  def with_reporter(
+    tool_name: String,
+    verbose: Boolean,
+    recode: String => String
+  )(body: Reporter => Int): Int = {
+    val reporter = new Reporter(tool_name, verbose, recode)
+    val heartbeat = reporter.start_heartbeat()
+    try { body(reporter) }
+    finally { reporter.stop_heartbeat(heartbeat) }
+  }
+
+
+  /* supervised ML process */
+
+  final case class Run_Outcome(
+    process_result: Process_Result,
+    fatal_message: Option[String],
+    timed_out: Boolean
+  ) {
+    def exit_code: Int =
+      if (fatal_message.nonEmpty || timed_out || process_result.rc != 0) 1 else 0
+  }
+
+  def run_ml_process(
+    options: Options,
+    prepared: Prepared_Theory,
+    reporter: Reporter
+  )(write_program: Path => Path): Run_Outcome = {
+    Isabelle_System.with_tmp_dir("cli_tool") { tmp_dir =>
+      val script_path = write_program(tmp_dir)
+      val server = Bash.Server.start(Logger.none)
+      var watchdog: Option[Future[Unit]] = None
+
+      try {
+        val store = Store(options)
+        val qd_options =
+          options + "quick_and_dirty" +
+            ("bash_process_address=" + server.address) +
+            ("bash_process_password=" + server.password)
+        val session_background =
+          Sessions.background(
+            qd_options, prepared.logic, dirs = prepared.dirs).check_errors
+        val session_heaps =
+          store.session_heaps(session_background, logic = prepared.logic)
+        val (_, process) =
+          ML_Process(
+            qd_options,
+            session_background,
+            session_heaps,
+            args = List("--use", File.platform_path(script_path)),
+            cwd = prepared.thy_dir,
+            redirect = false)
+
+        val wall_timeout =
+          sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
+            case Some(s) if s.nonEmpty => Value.Int.parse(s)
+            case _ => 900
+          }
+        val timed_out = Synchronized(false)
+        val received_event = Synchronized(false)
+        watchdog =
+          if (wall_timeout > 0) {
+            Some(
+              Future.thread("cli_tool_watchdog") {
+                Time.seconds(wall_timeout.toDouble).sleep()
+                timed_out.change(_ => true)
+                reporter.fatal(
+                  "wall-clock timeout after " + wall_timeout +
+                    "s; ML process terminated to avoid an orphaned session.")
+                process.terminate()
+              })
+          }
+          else None
+
+        def stdout(line: String): Unit =
+          decode_event(line) match {
+            case Some(event) =>
+              received_event.change(_ => true)
+              reporter.handle(event)
+            case None =>
+              if (
+                received_event.value &&
+                line != "don't export proof" &&
+                line != "val it = (): unit"
+              )
+                reporter.result(line)
+          }
+
+        def stderr(line: String): Unit =
+          reporter.diagnostic(line)
+
+        val result =
+          process.result(
+            progress_stdout = stdout,
+            progress_stderr = stderr,
+            strict = false)
+
+        if (result.rc != 0 && reporter.fatal_message.isEmpty) {
+          reporter.fatal("ML process failed (return code " + result.rc + ").")
+          if (result.err.nonEmpty) reporter.diagnostic(result.err)
+          if (result.out.nonEmpty && !received_event.value)
+            reporter.diagnostic(result.out)
+        }
+
+        Run_Outcome(result, reporter.fatal_message, timed_out.value)
+      }
+      finally {
+        watchdog.foreach(_.cancel())
+        server.stop()
+      }
+    }
+  }
 }
