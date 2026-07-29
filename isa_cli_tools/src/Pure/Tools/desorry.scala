@@ -18,6 +18,16 @@ The ML script is split into two phases:
     are accessible.  (After Pure.thy sets ML_write_global = false, HOL
     structures only exist in the theory-local ML namespace.)
 Communication between phases uses refs in a global ML structure.
+Successful replacements are staged in the supervised temporary directory;
+Scala commits the backup and atomic target rename only after a clean ML
+outcome.
+
+Replay stops at the first ordinary error, before proof search or mutation.
+Explicit -L targets must be unique, positive, in range, reachable before the
+optional stop line, and parsed sorry transitions.  Phase progress and
+diagnostics are streamed to stderr; proof results go to stdout.  After 15
+seconds of visible silence a sparse heartbeat reports the latest replay or
+proof-search position.  Fatal outcomes exit nonzero.
 
 An overall wall-clock safeguard hard-terminates the spawned ML process group if
 the whole run exceeds a bound (default 900s; override via the env var
@@ -35,41 +45,10 @@ import scala.collection.mutable
 
 object Desorry {
 
-  /** sentinel markers for extracting output from ML stdout **/
-
-  private val sentinel_start = "===DESORRY_BEGIN==="
-  private val sentinel_end   = "===DESORRY_END==="
-
-  /** prefix for user-facing result lines (filtered in non-verbose mode) **/
-
-  private val result_tag = "[RESULT] "
-
   /** Sledgehammer timeout per sorry (seconds), fixed **/
 
   private val sledgehammer_timeout = 50
-
-  private val ml_local_protocol_handlers =
-    """
-fun desorry_with_local_protocol_handlers f x =
-  let
-    val old_protocol_message_fn = ! Private_Output.protocol_message_fn;
-
-    fun local_protocol_message props _ =
-      if Properties.get props "function" = SOME "invoke_scala" andalso
-         Properties.get props Markup.nameN = SOME "bibtex_session_entries"
-      then
-        (case Properties.get props Markup.idN of
-          SOME id =>
-            Protocol_Command.run "Scala.result"
-              [Bytes.string id, Bytes.string "1"]
-        | NONE => ())
-      else old_protocol_message_fn props [];
-  in
-    Unsynchronized.setmp Private_Output.protocol_message_fn
-      local_protocol_message f x
-  end;
-"""
-
+  private val staged_artifact = "desorry_staged.thy"
 
   /** Phase 2 ML script: Sledgehammer invocation (evaluated within theory context) **/
 
@@ -179,25 +158,40 @@ let
   val sorry_states = ! Desorry_Comm.sorry_states;
   val timeout = ! Desorry_Comm.timeout;
   val n = length sorry_states;
-  val _ = writeln ("desorry: running Sledgehammer on " ^
-                   Int.toString n ^ " sorry(s) in parallel...");
+  val completed = Synchronized.var "desorry_completed" 0;
+
+  fun note_completed () =
+    let
+      val current =
+        Synchronized.change_result completed
+          (fn count => (count + 1, count + 1));
+      val _ = CLI_Tool_Event.status "proof search"
+        NONE NONE (SOME current) (SOME n);
+    in () end;
 
   val results =
     Par_List.map (fn (line, state) =>
-      (case Exn.result (fn () =>
-        case try_sledgehammer timeout state of
-          SOME text =>
-            (writeln ("[RESULT] sorry replaced at line " ^
-                      Int.toString line ^ " with " ^ text);
-             SOME (line, text))
-        | NONE =>
-            (writeln ("[RESULT] no proof found at line " ^
-                      Int.toString line);
-             NONE)) () of
-        Exn.Res r => r
-      | Exn.Exn exn =>
-          (warning ("desorry: [line " ^ Int.toString line ^ "] " ^
-                    Runtime.exn_message exn); NONE))
+      let
+        val result =
+          (case Exn.result (fn () =>
+            case try_sledgehammer timeout state of
+              SOME text =>
+                (CLI_Tool_Event.result
+                   ("sorry replaced at line " ^ Int.toString line ^
+                    " with " ^ text);
+                 SOME (line, text))
+            | NONE =>
+                (CLI_Tool_Event.result
+                   ("no proof found at line " ^ Int.toString line);
+                 NONE)) () of
+            Exn.Res value => value
+          | Exn.Exn exn =>
+              (CLI_Tool_Event.warning
+                 ("[line " ^ Int.toString line ^ "] " ^
+                  Runtime.exn_message exn);
+               NONE));
+        val _ = note_completed ();
+      in result end
     ) sorry_states
     |> List.mapPartial I;
 
@@ -211,7 +205,8 @@ end;
 
   private def ml_script_phase1(
     thy_file: Path, stop_line: Int, sledge_timeout: Int, cmd_timeout: Int,
-    target_lines: List[Int], phase2_path: Path
+    target_lines: List[Int], phase2_path: Path, staged_path: Path,
+    event_token: String
   ): String = {
     val thy_path_ml = ML_Syntax.print_string_bytes(File.platform_path(thy_file.absolute))
     val stop_line_ml = ML_Syntax.print_int(stop_line)
@@ -219,11 +214,11 @@ end;
     val cmd_timeout_ml = ML_Syntax.print_int(cmd_timeout)
     val target_lines_ml = ML_Syntax.print_list(ML_Syntax.print_int)(target_lines)
     val phase2_path_ml = ML_Syntax.print_string_bytes(File.platform_path(phase2_path))
-    val sentinel_start_ml = ML_Syntax.print_string_bytes(sentinel_start)
-    val sentinel_end_ml = ML_Syntax.print_string_bytes(sentinel_end)
+    val staged_path_ml = ML_Syntax.print_string_bytes(File.platform_path(staged_path))
 
     s"""
-${ml_local_protocol_handlers}
+${Cli_Tool_Common.ml_protocol_handlers}
+${Cli_Tool_Common.ml_event_protocol(event_token)}
 
 structure Desorry_Comm = struct
   val sorry_states : (int * Proof.state) list Unsynchronized.ref = Unsynchronized.ref [];
@@ -232,6 +227,7 @@ structure Desorry_Comm = struct
 end;
 
 exception Desorry_Timeout of int * string;
+exception Desorry_Replay_Error of int * string * string;
 
 let
   val thy_path = ${thy_path_ml};
@@ -240,6 +236,7 @@ let
   val cmd_timeout = ${cmd_timeout_ml} : int;
   val target_lines = ${target_lines_ml} : int list;
   val phase2_path = ${phase2_path_ml};
+  val staged_path = Path.explode ${staged_path_ml};
 
   val thy_file = Path.explode thy_path;
   val original = File.read thy_file;
@@ -249,25 +246,11 @@ let
     if line >= 1 andalso line <= length file_lines
     then List.nth (file_lines, line - 1) else "";
 
-  fun execute_transition tr st =
-    let
-      val line = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
-    in
-      (case Exn.result (fn () =>
-          Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-            (fn () => Toplevel.command_exception true tr st) ()) () of
-        Exn.Res st' => st'
-      | Exn.Exn (Timeout.TIMEOUT _) => raise Desorry_Timeout (line, line_content line)
-      | Exn.Exn exn =>
-          (warning ("desorry: error at line " ^ Int.toString line ^ ": " ^
-                    Runtime.exn_message exn); st))
-    end;
-
   val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
   val options = Options.default ();
 
-  val _ = desorry_with_local_protocol_handlers (fn () =>
+  val _ = cli_tool_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
       else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
@@ -284,14 +267,89 @@ let
   val transitions =
     Outer_Syntax.parse_text init_thy (fn () => init_thy) pos original;
 
+  fun transition_line tr = Position.line_of (Toplevel.pos_of tr);
+  fun is_sorry tr = Toplevel.name_of tr = "sorry";
+
+  val scoped_transitions =
+    if stop_line > 0 then
+      take_prefix (fn tr =>
+        (case transition_line tr of
+          SOME line => line < stop_line
+        | NONE => true)) transitions
+    else transitions;
+
+  val all_sorry_lines =
+    transitions
+    |> map_filter (fn tr => if is_sorry tr then transition_line tr else NONE);
+  val scoped_sorry_lines =
+    scoped_transitions
+    |> map_filter (fn tr => if is_sorry tr then transition_line tr else NONE);
+  val not_sorry_targets =
+    filter_out (fn line => member (op =) all_sorry_lines line) target_lines;
+  val excluded_targets =
+    filter (fn line =>
+      member (op =) all_sorry_lines line andalso
+      not (member (op =) scoped_sorry_lines line)) target_lines;
+  val target_errors =
+    (if null not_sorry_targets then []
+     else ["target line(s) are not sorry transitions: " ^
+       commas (map Int.toString not_sorry_targets)]) @
+    (if null excluded_targets then []
+     else ["target line(s) excluded by stop line: " ^
+       commas (map Int.toString excluded_targets)]);
+
+  val replay_total =
+    length (filter_out Toplevel.is_ignored scoped_transitions);
+  val replay_completed = Unsynchronized.ref 0;
+
+  fun note_progress tr =
+    if Toplevel.is_ignored tr then ()
+    else
+      let
+        val current = ! replay_completed + 1;
+        val _ = replay_completed := current;
+      in
+        if current mod 250 = 0 orelse current = replay_total
+        then CLI_Tool_Event.status "replay"
+          (SOME current) (SOME replay_total) NONE NONE
+        else ()
+      end;
+
+  fun execute_transition tr st =
+    let
+      val line = the_default 0 (transition_line tr);
+      val warn_buf = Unsynchronized.ref ([] : string list);
+      val capture_warn = (fn ss => warn_buf := implode ss :: ! warn_buf);
+      val result =
+        Unsynchronized.setmp Private_Output.writeln_fn (fn _ => ())
+          (fn () => Unsynchronized.setmp Private_Output.warning_fn capture_warn
+            (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture_warn
+              (fn () => Exn.result (fn () =>
+                Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
+                  (fn () => Toplevel.command_exception true tr st) ()) ()) ()) ()) ();
+      val _ = List.app (fn msg =>
+        CLI_Tool_Event.warning
+          ("Warning at line " ^ Int.toString line ^
+           " (" ^ line_content line ^ "): " ^ msg)) (rev (! warn_buf));
+    in
+      (case result of
+        Exn.Res st' => (note_progress tr; st')
+      | Exn.Exn (Timeout.TIMEOUT _) =>
+          raise Desorry_Timeout (line, line_content line)
+      | Exn.Exn (Runtime.EXCURSION_FAIL (exn, _)) =>
+          raise Desorry_Replay_Error
+            (line, line_content line, Runtime.exn_message exn)
+      | Exn.Exn exn =>
+          raise Desorry_Replay_Error
+            (line, line_content line, Runtime.exn_message exn))
+    end;
+
   fun process [] _ acc = rev acc
     | process (tr :: rest) st acc =
         let
-          val tr_line = (case Position.line_of (Toplevel.pos_of tr) of
-              SOME l => l | NONE => 0)
+          val tr_line = the_default 0 (transition_line tr)
         in
-          if stop_line > 0 andalso tr_line >= stop_line then rev acc
-          else if Toplevel.name_of tr = "sorry" then
+          if is_sorry tr then
             let
               val keep_sorry = null target_lines orelse Library.member (op =) target_lines tr_line
               val sorry_state =
@@ -329,135 +387,89 @@ let
       |> String.concatWith "\\n"
     end;
 
-  val () = writeln ${sentinel_start_ml};
   val () =
-    (let
-       val _ = Desorry_Comm.timeout := sledge_timeout;
-       val sorry_states = process transitions (Toplevel.make_state NONE) [];
-       val n_total = length sorry_states;
-     in
-       if n_total = 0 then
-         writeln "[RESULT] no sorry's found"
-       else
-         let
-           val _ = Desorry_Comm.sorry_states := sorry_states;
-           val _ = Context.setmp_generic_context
-             (SOME (Context.Theory init_thy))
-             (fn () => ML_Context.eval_file ML_Compiler.flags
-               (Path.explode phase2_path)) ();
-           val replacements = map (fn (l, t) =>
-             {line = l, text = t} : replacement)
-             (! Desorry_Comm.replacements);
-           val n_found = length replacements;
-         in
-           if n_found = 0 then
-             writeln
-               "[RESULT] Sledgehammer could not find proofs for any sorry"
-           else
-             let
-               val modified = apply_replacements original replacements;
-               val backup_path = Path.ext "backup" thy_file;
-               val tmp_path = Path.ext "desorry_tmp" thy_file;
-               val _ = File.write backup_path original;
-               val _ = File.write tmp_path modified;
-               val _ = OS.FileSys.rename {
-                 old = File.platform_path tmp_path,
-                 new = File.platform_path thy_file};
-             in
-               writeln ("desorry: backup written to " ^
-                        Path.implode backup_path);
-               writeln ("[RESULT] replaced " ^ Int.toString n_found ^
-                        " of " ^ Int.toString n_total ^ " sorry(s)")
-             end
-         end
-     end)
-    handle Desorry_Timeout (line, content) =>
-      writeln ("[RESULT] desorry: timed out after " ^ Int.toString cmd_timeout ^
-               "s at line " ^ Int.toString line ^ " (" ^ content ^
-               "); no changes written.");
+    if not (null target_errors) then
+      CLI_Tool_Event.fatal (cat_lines target_errors)
+    else
+      ((let
+         val _ = Desorry_Comm.timeout := sledge_timeout;
+         val _ = CLI_Tool_Event.status "replay"
+           (SOME 0) (SOME replay_total) NONE NONE;
+         val sorry_states =
+           process scoped_transitions (Toplevel.make_state NONE) [];
+         val captured_lines = sort int_ord (map fst sorry_states);
+         val requested_lines = sort int_ord target_lines;
+         val exact_targets =
+           null target_lines orelse captured_lines = requested_lines;
+         val n_total = length sorry_states;
+       in
+         if not exact_targets then
+           CLI_Tool_Event.fatal
+             ("captured sorry lines did not match requested targets: requested " ^
+              commas (map Int.toString requested_lines) ^ "; captured " ^
+              commas (map Int.toString captured_lines))
+         else if n_total = 0 then
+           CLI_Tool_Event.result "no sorry's found"
+         else
+           let
+             val _ = Desorry_Comm.sorry_states := sorry_states;
+             val _ = CLI_Tool_Event.status "proof search"
+               NONE NONE (SOME 0) (SOME n_total);
+             val _ = Context.setmp_generic_context
+               (SOME (Context.Theory init_thy))
+               (fn () => ML_Context.eval_file ML_Compiler.flags
+                 (Path.explode phase2_path)) ();
+             val replacements = map (fn (l, t) =>
+               {line = l, text = t} : replacement)
+               (! Desorry_Comm.replacements);
+             val n_found = length replacements;
+           in
+             if n_found = 0 then ()
+             else
+               let
+                 val modified = apply_replacements original replacements;
+               in
+                 File.write staged_path modified
+               end
+           end
+       end)
+       handle Desorry_Timeout (line, content) =>
+         CLI_Tool_Event.fatal
+           ("timed out after " ^ Int.toString cmd_timeout ^
+            "s at line " ^ Int.toString line ^ " (" ^ content ^
+            "); no changes written.")
+        | Desorry_Replay_Error (line, content, message) =>
+         CLI_Tool_Event.fatal
+           ("replay error at line " ^ Int.toString line ^
+            " (" ^ content ^ "): " ^ message ^ "; no changes written."));
 in
-  writeln ${sentinel_end_ml}
+  ()
 end;
 """
   }
 
 
-  /** derive logic session from theory imports **/
-
-  private def derive_logic(
-    options: Options,
-    thy_file: Path,
-    dirs: List[Path]
-  ): String = {
-    try {
-      val node_name = Document.Node.Name(thy_file.absolute.implode,
-        theory = Thy_Header.get_thy_name(
-          thy_file.base.implode).getOrElse(""))
-      val header = Thy_Header.read(node_name,
-        Scan.char_reader(File.read(thy_file)),
-        command = false, strict = false)
-
-      val theory_names =
-        header.imports.map { case (s, _) => Thy_Header.import_name(s) }
-      if (theory_names.isEmpty)
-        return Isabelle_System.default_logic()
-
-      val sessions_structure =
-        Sessions.load_structure(options, dirs = dirs)
-
-      val session_candidates = theory_names.flatMap { name =>
-        val qualifier = sessions_structure.theory_qualifier(name)
-        if (qualifier.nonEmpty && sessions_structure.defined(qualifier))
-          Some(qualifier)
-        else None
-      }.distinct
-
-      if (session_candidates.isEmpty) Isabelle_System.default_logic()
-      else {
-        val graph = sessions_structure.imports_graph
-        session_candidates.maxBy { s =>
-          try { graph.all_preds(List(s)).size }
-          catch { case _: Graph.Undefined[_] => 0 }
-        }
-      }
-    }
-    catch {
-      case ERROR(_) => Isabelle_System.default_logic()
-    }
-  }
-
-
-  /** check logic session without building heaps **/
-
-  private def check_logic_heap(
-    options: Options,
-    logic: String,
-    dirs: List[Path],
-    progress: Progress
-  ): Unit = {
-    val results =
-      Build.build(options,
-        selection = Sessions.Selection.session(logic),
-        progress = progress,
-        build_heap = true,
-        no_build = true,
-        dirs = dirs)
-
-    if (!results.ok) {
-      error("Session heap for " + quote(logic) + " is not available or not up to date; " +
-        "refusing to build it automatically.\n\n" +
-        "How to run this safely:\n" +
-        "  1. Choose a session whose heap is already built.\n" +
-        "  2. If the theory belongs to an unbuilt session, use that session's built parent " +
-        "with -l and pass -d for the directory containing the ROOT file.\n" +
-        "  3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]\n\n" +
-        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
-        "  isabelle desorry -l HOL-Computational_Algebra -d $ISABELLE_HOME/src/HOL FILE.thy")
-    }
-  }
-
-
   /** desorry **/
+
+  private def validate_target_numbers(lines: List[Int]): Unit = {
+    val nonpositive = lines.filter(_ <= 0).distinct.sorted
+    val duplicates =
+      lines.groupMapReduce(identity)(_ => 1)(_ + _)
+        .collect { case (line, count) if count > 1 => line }.toList.sorted
+    val messages =
+      List(
+        if (nonpositive.nonEmpty)
+          Some(
+            "nonpositive target line(s): " +
+              commas(nonpositive.map(_.toString)))
+        else None,
+        if (duplicates.nonEmpty)
+          Some(
+            "duplicate target line(s): " +
+              commas(duplicates.map(_.toString)))
+        else None).flatten
+    if (messages.nonEmpty) error(cat_lines(messages))
+  }
 
   def desorry(
     options: Options,
@@ -469,150 +481,96 @@ end;
     dirs: List[Path] = Nil,
     verbose: Boolean = false,
     progress: Progress = new Progress
-  ): Unit = {
+  ): Int = {
+    validate_target_numbers(target_lines)
 
-    /* read theory content */
+    Cli_Tool_Common.with_reporter("desorry", verbose, identity) { reporter =>
+      reporter.phase(
+        "preparing theory and checking session heap...",
+        Cli_Tool_Common.Status(phase = "preflight"))
 
-    val content = File.read(thy_file)
-    val file_lines = split_lines(content)
-
-    Thy_Header.get_thy_name(thy_file.base.implode)
-      .getOrElse(error(
-        "Cannot determine theory name from " + thy_file))
-
-
-    /* parse header and resolve path-based imports */
-
-    val thy_dir = thy_file.absolute.dir
-
-    val node_name = Document.Node.Name(thy_file.absolute.implode,
-      theory = Thy_Header.get_thy_name(
-        thy_file.base.implode).getOrElse(""))
-    val header = Thy_Header.read(node_name,
-      Scan.char_reader(content), command = false, strict = false)
-
-    val import_dirs: List[Path] = header.imports.flatMap {
-      case (s, _) =>
-        try {
-          val raw = Path.explode(s)
-          if (raw.implode.contains("/")) {
-            val import_dir =
-              if (raw.is_absolute) raw.dir.absolute
-              else (thy_dir + raw).dir.absolute
-            if (import_dir.is_dir) Some(import_dir) else None
-          }
-          else None
-        }
-        catch { case ERROR(_) => None }
-    }.distinct
-
-    val all_dirs = (dirs ::: import_dirs).distinct
-
-
-    /* determine the logic session */
-
-    val effective_logic =
-      if (logic.nonEmpty) logic
-      else derive_logic(options, thy_file, all_dirs)
-
-    progress.echo_if(verbose, "Logic session: " + effective_logic)
-
-
-    /* ensure logic heap is available without building */
-
-    check_logic_heap(options, effective_logic, all_dirs, progress)
-
-
-    /* run the ML scripts via ML_Process */
-
-    Isabelle_System.with_tmp_dir("desorry") { tmp_dir =>
-
-      val phase2_path = tmp_dir + Path.explode("desorry_phase2.ML")
-      File.write(phase2_path, ml_script_phase2())
-
-      val script_content =
-        ml_script_phase1(thy_file, stop_line, sledgehammer_timeout, cmd_timeout,
-          target_lines, phase2_path)
-      val script_path = tmp_dir + Path.explode("desorry.ML")
-      File.write(script_path, script_content)
-
-      val server = Bash.Server.start()
-
-      val store = Store(options)
-      val qd_options = options + "quick_and_dirty" +
-        ("bash_process_address=" + server.address) +
-        ("bash_process_password=" + server.password)
-      val session_background =
-        Sessions.background(qd_options, effective_logic,
-          dirs = all_dirs).check_errors
-      val session_heaps =
-        store.session_heaps(session_background,
-          logic = effective_logic)
-
-      val process =
-        ML_Process(qd_options, session_background, session_heaps,
-          args = List("--use", File.platform_path(script_path)),
-          cwd = thy_dir,
-          redirect = false)
-
-      /* overall wall-clock watchdog: hard-terminate the ML process group if the
-         run exceeds the safety bound, so a hang the per-command / Sledgehammer
-         timeouts cannot preempt (e.g. session-heap loading or GC/swap thrash)
-         cannot leave an orphaned multi-GB poly process behind.  Machine-protection
-         safeguard, not a tunable: default 900s (15 min), overridable only via
-         ISABELLE_CLI_TOOLS_WALL_TIMEOUT (tests / rare huge heaps; 0 disables). */
-      val wall_timeout =
-        sys.env.get("ISABELLE_CLI_TOOLS_WALL_TIMEOUT") match {
-          case Some(s) if s.nonEmpty => Value.Int.parse(s)
-          case _ => 900
-        }
-      val timed_out = Synchronized(false)
-      val watchdog =
-        if (wall_timeout > 0)
-          Some(Future.thread("desorry_watchdog") {
-            Time.seconds(wall_timeout.toDouble).sleep()
-            timed_out.change(_ => true)
-            process.terminate()
-          })
-        else None
-
-      val result =
-        try process.result(strict = false)
-        finally { watchdog.foreach(_.cancel()); server.stop() }
-
-      if (timed_out.value)
-        progress.echo("desorry: wall-clock timeout after " + wall_timeout +
-          "s; ML process terminated to avoid an orphaned session (file left unchanged).")
-
-
-      /* extract output between sentinels */
-
-      val all_lines = split_lines(result.out)
-      val raw_output = all_lines
-        .dropWhile(_ != sentinel_start).drop(1)
-        .takeWhile(_ != sentinel_end)
-
-      if (raw_output.nonEmpty) {
-        if (verbose)
-          raw_output.foreach(s =>
-            progress.echo(
-              if (s.startsWith(result_tag)) s.stripPrefix(result_tag)
-              else s))
-        else
-          raw_output.collect {
-            case s if s.startsWith(result_tag) => s.stripPrefix(result_tag)
-          }.foreach(s => progress.echo(s))
+      val prepared =
+        Cli_Tool_Common.prepare_theory(options, thy_file, logic, dirs)
+      val beyond_end =
+        target_lines.filter(_ > prepared.file_lines.length).distinct.sorted
+      if (beyond_end.nonEmpty) {
+        error(
+          "target line(s) beyond end of file: " +
+            commas(beyond_end.map(_.toString)))
       }
-      else if (result.rc != 0) {
-        progress.echo("desorry: failed (return code " + result.rc + ")")
-        if (result.err.nonEmpty) progress.echo(result.err)
-        if (result.out.nonEmpty) progress.echo(result.out)
-      }
-      else
-        progress.echo("desorry: no output")
 
-      if (verbose && result.err.nonEmpty)
-        progress.echo_warning(result.err)
+      reporter.diagnostic_if_verbose("Logic session: " + prepared.logic)
+      Cli_Tool_Common.check_logic_heap(
+        options,
+        prepared,
+        progress,
+        "Example for a theory importing HOL-Algebra.* when HOL-Algebra is not built:\n" +
+          "  isabelle desorry -l HOL-Computational_Algebra -d " +
+          "$ISABELLE_HOME/src/HOL FILE.thy")
+
+      reporter.phase(
+        "starting ML process...",
+        Cli_Tool_Common.Status(phase = "startup"))
+
+      val outcome =
+        Cli_Tool_Common.run_ml_process(
+          options,
+          prepared,
+          reporter,
+          artifact_names = List(staged_artifact)
+        ) { tmp_dir =>
+          val phase2_path = tmp_dir + Path.explode("desorry_phase2.ML")
+          val staged_path = tmp_dir + Path.basic(staged_artifact)
+          File.write(phase2_path, ml_script_phase2())
+          val script_path = tmp_dir + Path.explode("desorry.ML")
+          File.write(
+            script_path,
+            ml_script_phase1(
+              thy_file,
+              stop_line,
+              sledgehammer_timeout,
+              cmd_timeout,
+              target_lines,
+              phase2_path,
+              staged_path,
+              reporter.event_token))
+          script_path
+        }
+
+      if (outcome.exit_code != 0) outcome.exit_code
+      else {
+        outcome.artifacts.get(staged_artifact) match {
+          case None => 0
+          case Some(modified) =>
+            val target = prepared.thy_file.absolute
+            val backup_path = target.ext("backup")
+            val tmp_path = target.ext("desorry_tmp")
+
+            def remove_tmp(): Unit =
+              if (tmp_path.is_file) {
+                try { tmp_path.file.delete(); () }
+                catch { case _: Throwable => }
+              }
+
+            try {
+              File.write(tmp_path, modified)
+              File.write(backup_path, prepared.content)
+              Isabelle_System.move_file(tmp_path, target)
+              reporter.warning(
+                "proof replacements committed; backup written to " +
+                  backup_path.implode)
+              0
+            }
+            catch {
+              case exn if !Exn.is_interrupt(exn) =>
+                remove_tmp()
+                reporter.fatal(
+                  "could not commit proof replacements: " +
+                    Exn.message(exn))
+                1
+            }
+        }
+      }
     }
   }
 
@@ -635,7 +593,8 @@ end;
 Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   Options are:
-    -L LINES     comma-separated list of line numbers to target (e.g., 42,105)
+    -L LINES     unique, positive lines of parsed, reachable sorry commands
+                 (comma-separated, e.g., 42,105)
     -d DIR       include session directory for import resolution
     -l NAME      logic session name (override automatic derivation)
     -o OPTION    override Isabelle system option
@@ -650,6 +609,9 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
   The logic session is derived automatically from the theory's imports.
   Sibling imports in the same directory are loaded automatically.
+  Progress and diagnostics are written to stderr; proof results are written
+  to stdout. A heartbeat appears after 15 seconds of silence. Replay and
+  target-validation failures exit nonzero and write nothing.
   Each replayed command is bounded by -t seconds; if a tactic exceeds it
   (e.g. a non-terminating proof) desorry stops, reports the line, and writes
   nothing.
@@ -679,8 +641,10 @@ Usage: isabelle desorry [OPTIONS] THY_FILE [LINE]
 
       val progress = new Console_Progress(verbose = verbose)
 
-      desorry(options, thy_file, stop_line = line, cmd_timeout = cmd_timeout,
-        target_lines = target_lines, logic = logic, dirs = dirs.toList,
-        verbose = verbose, progress = progress)
+      val rc =
+        desorry(options, thy_file, stop_line = line, cmd_timeout = cmd_timeout,
+          target_lines = target_lines, logic = logic, dirs = dirs.toList,
+          verbose = verbose, progress = progress)
+      if (rc != 0) sys.exit(rc)
     })
 }
