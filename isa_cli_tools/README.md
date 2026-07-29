@@ -5,10 +5,50 @@ Two command-line tools for Isabelle that work without jEdit or PIDE:
 - **`isabelle eval_at`** — evaluate any Isabelle command at a given theory line
 - **`isabelle desorry`** — replace `sorry` proofs with Sledgehammer results
 
-Both tools auto-detect the logic session and handle sibling imports
-automatically. They require the chosen logic's session heap to be **already
-built**, and verify this before doing any work (see
-[Sessions](#sessions-how-the-tools-find-the-right-logic)).
+Both tools attempt to derive the logic session from the target theory's imports
+and load sibling imports from source. Custom sessions can require explicit
+`-l` and `-d` options. The chosen logic's session heap must be **already
+built**; the tools verify this before starting Isabelle/ML work (see
+[Sessions and Logic Selection](#sessions-and-logic-selection)).
+
+## Contents
+
+- [For AI agents: session preflight](#for-ai-agents-session-preflight)
+- [Installation](#installation)
+- [Shared execution behavior](#shared-execution-behavior)
+- [`eval_at`](#eval_at--evaluate-a-command-at-a-theory-line)
+- [`desorry`](#desorry--replace-sorry-proofs-with-sledgehammer-results)
+- [Sessions and logic selection](#sessions-and-logic-selection)
+- [Troubleshooting](#troubleshooting)
+- [Known limitations](#known-limitations)
+
+---
+
+## For AI Agents: Session Preflight
+
+Before invoking `eval_at` or `desorry`:
+
+1. Read the target theory's `imports` and its local `ROOT`.
+2. Choose a logic session whose actual heap is already built. The tools never
+   build heaps and immediately refuse an unavailable or outdated heap.
+3. Check the candidate with `isabelle build -b -n SESSION`; for a custom
+   session, use `isabelle build -b -n -d ROOT_DIR SESSION`. The `-b` option
+   makes the dry run check for an actual heap image. If the theory's own
+   session is unbuilt, use its built parent with `-l`.
+4. Pass `-d ROOT_DIR` when sibling or bare-name imports depend on a local
+   `ROOT`.
+
+Typical invocation for a theory in an unbuilt custom session:
+
+```bash
+isabelle eval_at -l Parent_Session -d /project/root My_Theory.thy 15
+isabelle desorry -l Parent_Session -d /project/root My_Theory.thy
+```
+
+A requirements image such as `My_Session_requirements(Parent_Session)` contains
+the session's ancestry, not `My_Session`'s own theories; use the built parent
+heap in that case. See [Sessions and Logic Selection](#sessions-and-logic-selection)
+for derivation rules and detailed examples.
 
 ---
 
@@ -16,12 +56,33 @@ built**, and verify this before doing any work (see
 
 ### Prerequisites
 
-An Isabelle development installation compatible with repository changeset
-`5085f506929bfb3124fbfb1ab0d50063e537fc25` on the `default` branch
-(2026-07-27, `tuned names`).
+Choose the repository branch that matches the Isabelle installation:
+
+| Branch | Compatible Isabelle version |
+|---|---|
+| `main` | Isabelle development repository at changeset `5085f506929bfb3124fbfb1ab0d50063e537fc25` (`tuned names`, 2026-07-27) |
+| `2025` | Isabelle2025 |
+| `2025-2` | Isabelle2025-2 |
+
+For example:
 
 ```bash
-isabelle version   # must print a version string
+git switch 2025-2
+cd isa_cli_tools
+bash install.sh /Applications/Isabelle2025-2.app
+```
+
+The branches contain release-specific source adaptations. Select the branch
+before installing, and do not install sources from one branch into a different
+Isabelle release.
+
+Check the Isabelle installation you intend to modify explicitly:
+
+```bash
+/path/to/isabelle/bin/isabelle version
+
+# For main, also verify the Isabelle development checkout:
+hg -R /path/to/isabelle id -i
 ```
 
 ### Automated install
@@ -123,232 +184,61 @@ isabelle desorry   # prints usage
 
 ---
 
-## Sessions: How the Tools Find the Right Logic
+## Shared Execution Behavior
 
-**This is the most important concept for using these tools correctly.**
+### Per-command replay timeout (`-t`)
 
-Every Isabelle theory imports parent theories (`imports Main`, `imports
-Complex_Main`, `imports "HOL-Algebra.Ring"`, etc.). These parents live in
-**sessions** — Isabelle's compilation units, defined in `ROOT` files. Before
-the tools can process a theory, they must load the correct session heap
-containing all the imported theories.
+Both tools accept `-t SECS` (default: 60; `0` disables it). This bounds each
+individual Isabelle transition replayed from the target theory, such as one
+`apply`, `by`, or `have` command. For `eval_at` injection mode it also bounds
+the injected command. It is not a total runtime limit.
 
-### How automatic session derivation works
+When a command exceeds the limit, the tool reports its line and exits nonzero.
+`desorry` aborts before committing any proof replacements:
 
-Both tools read the theory's `imports` line and map each import to a session:
+```text
+eval_at: timed out after 60s at line 42 (apply (induct n)).
+desorry: timed out after 60s at line 17 (apply auto); no changes written.
+```
 
-| Import in `.thy` file | Derived session | Why |
-|---|---|---|
-| `Main` | `HOL` | `Main` is a global theory in the `HOL` session |
-| `Complex_Main` | `HOL` | `Complex_Main` is a global theory in the `HOL` session |
-| `"HOL-Library.Multiset"` | `HOL-Library` | Qualified name: everything before the last `.` |
-| `"HOL-Algebra.Ring"` | `HOL-Algebra` | Qualified name: `HOL-Algebra` |
-| `"HOL-Analysis.Analysis"` | `HOL-Analysis` | Qualified name: `HOL-Analysis` |
-| `Pure` | `Pure` | The base logic |
+The `-t` option does not control Sledgehammer proof-search time inside
+`desorry`; see [`desorry` proof search](#proof-search).
 
-When a theory imports from multiple sessions, the tools pick the **deepest**
-one (most dependencies in the session graph). For example, if a theory imports
-both `Complex_Main` (HOL) and `"HOL-Library.Multiset"` (HOL-Library),
-HOL-Library is selected because it depends on HOL.
+### Overall wall-clock safeguard
 
-### When automatic derivation works
+Both tools impose a separate hard limit on the complete spawned Isabelle/ML
+process: 900 seconds (15 minutes) by default. This safeguard also catches
+delays outside individual command evaluation, such as heap loading or severe
+GC and memory pressure, and terminates the process group to avoid leaving an
+orphaned `poly` process.
 
-For the vast majority of theories, automatic derivation just works:
+Override the default with `ISABELLE_CLI_TOOLS_WALL_TIMEOUT` in seconds. A value
+of `0` disables the safeguard:
 
 ```bash
-# Theory importing Main or Complex_Main -> derives HOL automatically
-isabelle eval_at MyTheory.thy 10
-
-# Theory importing HOL-Library -> derives HOL-Library automatically
-isabelle eval_at MyTheory.thy 10
-
-# Theory importing HOL-Algebra.Ring -> derives HOL-Algebra automatically
-isabelle eval_at AlgebraWork.thy 15
+ISABELLE_CLI_TOOLS_WALL_TIMEOUT=3600 isabelle eval_at Big.thy 200
 ```
 
-### When you need `-l` (override session)
+### Progress, heartbeats, and output streams
 
-Override session derivation with `-l SESSION` when:
+Both tools report preparation, heap checking, ML startup, and replay phases.
+If 15 seconds pass without a visible result, warning, or phase change, a
+heartbeat reports the latest replay or proof-search position:
 
-1. **The theory imports only unqualified names from an AFP or custom session**
-   that the tools cannot find without a ROOT file directory:
-
-   ```isabelle
-   theory MyWork imports Ring   (* bare name, not "HOL-Algebra.Ring" *)
-   begin
-   ```
-
-   ```bash
-   # The tools cannot map bare "Ring" to HOL-Algebra
-   # Fix: tell them which session
-   isabelle eval_at -l HOL-Algebra MyWork.thy 10
-   isabelle desorry -l HOL-Algebra MyWork.thy
-   ```
-
-2. **The theory lives inside a custom session** defined by a local ROOT file,
-   but the ROOT file is in a different directory:
-
-   ```bash
-   # The ROOT file defining session "My_Session" is in /project/root/
-   isabelle eval_at -l My_Session -d /project/root MyWork.thy 10
-   isabelle desorry -l My_Session -d /project/root MyWork.thy
-   ```
-
-### When you need `-d` (session directory)
-
-The `-d DIR` flag tells the tools where to find ROOT files that define
-sessions. Use it when:
-
-1. **The theory imports siblings from a directory with a ROOT file**:
-
-   ```bash
-   # ROOT file is in /project/ defining session "My_Project"
-   isabelle eval_at -d /project Subdir/MyTheory.thy 10
-   ```
-
-2. **The theory imports from an AFP entry** not in the standard search path:
-
-   ```bash
-   isabelle eval_at -d /path/to/afp/thys/Coinductive MyWork.thy 10
-   ```
-
-3. **Multiple session directories are needed**:
-
-   ```bash
-   isabelle eval_at -d /project/sessions -d /path/to/afp/thys/Foo MyWork.thy 10
-   ```
-
-### The session heap must already be built
-
-The tools **do not build session heaps.** Before processing a theory, each
-tool verifies that the chosen logic's heap is built and up to date. If it is
-not, the tool stops immediately with an actionable error instead of launching
-a (potentially multi-hour) compile:
-
-```bash
-isabelle eval_at -l HOL-Algebra MyTheory.thy 10
-#> *** Session heap for "HOL-Algebra" is not available or not up to date;
-#> *** refusing to build it automatically.
-#> *** How to run this safely:
-#> ***   1. Choose a session whose heap is already built.
-#> ***   2. If the theory belongs to an unbuilt session, use that session's
-#> ***      built parent with -l and pass -d for the directory containing the ROOT.
-#> ***   3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]
+```text
+desorry: preparing theory and checking session heap...
+desorry: starting ML process...
+desorry: replaying 2,400 transitions...
+desorry: still working: replay 1,250/2,400 transitions (15s without output)
 ```
 
-This is deliberate: a runaway background compile is the main hazard in an
-unattended/agent workflow. Build the heap yourself, once, as an explicit
-setup step, then query against it:
+Command and proof results go to stdout. Progress, heartbeats, warnings, and
+fatal diagnostics go to stderr. Fatal replay, timeout, ML-process, and
+watchdog outcomes exit nonzero.
 
-```bash
-# One-time setup: build the heap (slow — minutes for HOL, longer for others)
-isabelle build -b HOL
-
-# Thereafter every run reuses the cached heap and starts in seconds
-isabelle eval_at MyTheory.thy 10
-isabelle eval_at MyTheory.thy 20
-```
-
-Heaps live under `$ISABELLE_HEAPS/polyml-*/` (typically
-`~/.isabelle/<identifier>/heaps/...` for a release, or `~/.isabelle/heaps/...`
-for an unversioned repository build). List the built ones to see what is
-already available — each filename is a built session
-(`isabelle getenv ISABELLE_HEAPS` prints the exact directory).
-
-### Session examples from the Isabelle distribution
-
-Here are real theories and the sessions they require:
-
-```isabelle
-(* Session: HOL (the default for most work) *)
-theory MyBasics imports Main begin ... end
-theory MyAnalysis imports Complex_Main begin ... end
-
-(* Session: HOL-Library *)
-theory MyMultisets imports "HOL-Library.Multiset" begin ... end
-theory MyTimeFunctions imports Complex_Main "HOL-Library.Time_Functions" begin ... end
-
-(* Session: HOL-Algebra *)
-theory MyRings imports "HOL-Algebra.Ring" begin ... end
-
-(* Session: HOL-Analysis *)
-theory MyMeasure imports "HOL-Analysis.Analysis" begin ... end
-```
-
-For each of these, the tools derive the correct session automatically from the
-qualified import names.
-
-### Agent preflight: choosing the logic session
-
-**Read this before scripting `eval_at`/`desorry` (especially from an AI agent).**
-
-Before doing anything else, both tools check that the chosen logic's heap is
-built and up to date. If it is not, they **stop with an error** rather than
-building it (a custom session can take hours to compile). The single most
-important rule is therefore: *make `-l` point at a session whose heap already
-exists.* Pick an unbuilt session and the tool refuses — so choosing the right
-session is on you, the caller.
-
-Preflight checklist:
-
-1. **Read the theory's `imports` line and the local `ROOT`.** Identify which
-   session the theory belongs to (the `theories` clause of a `session` entry)
-   and what it actually depends on. A theory that only imports siblings +
-   `HOL-Analysis.Analysis` only needs `HOL-Analysis` in scope, regardless of
-   how big its own session is.
-
-2. **Check what is already built — never assume.**
-   - List built heaps:
-     `ls "$(isabelle getenv -b ISABELLE_HEAPS)"/polyml-*/`
-     (each filename is a built session; the directory is
-     `~/.isabelle/<identifier>/heaps/...` for a release such as Isabelle2025,
-     or `~/.isabelle/heaps/...` for an unversioned repository build). Names of the form
-     `Foo_requirements(Bar)` are **requirement images** produced by
-     `isabelle build -R Foo` / `isabelle jedit -R Foo` — they contain Foo's
-     *ancestry*, **not** Foo's own theories.
-   - Dry-run a session: `isabelle build -n SESSION` (add `-d DIR` if the
-     session is defined by a local ROOT). If it lists nothing to build, the
-     heap is up to date.
-   - Check session resolvability: `isabelle sessions [-d DIR] SESSION`.
-
-3. **Choose `-l` deliberately:**
-   - If the theory's *own* session heap is built, use it.
-   - If only a **requirements image** is built (the common case after
-     `isabelle jedit -d DIR -R SESSION`), the session's own theories are *not*
-     in any heap. Pass the **parent session** instead — the `PARENT` in
-     `session SESSION = "PARENT" + ...` in the ROOT — provided its heap is
-     built and contains the needed ancestry. The tool then replays the target
-     theory *and its siblings* from source on top of that heap.
-   - **Prefer a session whose heap is already built.** Passing
-     `-l <unbuilt session>` is not catastrophic — the tool refuses up front
-     rather than building — but it just wastes a round-trip, so aim to get it
-     right the first time.
-
-4. **Pass `-d DIR`** (the directory containing the ROOT) so sibling and
-   bare-name imports resolve. It is best to set `-l` explicitly as well: with
-   `-d` and **no** `-l`, automatic derivation may map a bare sibling import to
-   its member session — which may be the *unbuilt* one — and the tool then
-   refuses, costing you a round-trip.
-
-Worked example. A theory belongs to a local session `My_Session` whose own
-heap has **not** been built — only a requirements image exists (e.g. from
-`isabelle jedit -d . -R My_Session`). The ROOT declares
-`session My_Session = "Parent_Session" + ...`, and `Parent_Session` is built
-and already contains everything the theory imports. Then:
-
-```bash
-# Correct: reuses the built parent heap, replays the theory + siblings from
-# source on top, and builds nothing.
-isabelle eval_at -l Parent_Session -d . My_Theory.thy 15
-
-# Refused: My_Session's heap is not built -> the tool stops with an error
-# (it does not compile). You then re-run with the parent session as above.
-isabelle eval_at -l My_Session -d . My_Theory.thy 15
-
-# Also refused: no -l -> derivation may pick the unbuilt member session,
-# and the tool stops with the same error. Set -l to avoid the round-trip.
-isabelle eval_at -d . My_Theory.thy 15
-```
+Ordinary replay errors in `eval_at` state mode are intentionally diagnostic:
+they are reported on stderr, evaluation continues from the preceding state,
+and the command exits successfully unless a fatal condition occurs.
 
 ---
 
@@ -456,7 +346,7 @@ isabelle eval_at MyTheory.thy 15 'nitpick'
 | `-s` | Show proof state after command output (for injection mode) |
 | `-t SECS` | Per-command timeout in seconds (default: 60; 0 disables) |
 | `-T` | Report timing for each processed line |
-| `-v` | Verbose: show derived session, heap-check progress, ML errors |
+| `-v` | Show the derived logic and verbose heap-check diagnostics |
 
 Options must come before positional arguments.
 
@@ -499,76 +389,6 @@ isabelle eval_at -s MyTheory.thy 15 'apply auto'
 Informational commands (`thm`, `term`, `value`, `find_theorems`) produce their
 own output; `-s` is unnecessary for them (but harmless).
 
-### Per-command timeout (`-t`)
-
-Both `eval_at` and `desorry` accept `-t SECS` (default: 60; use 0 to disable).
-This bounds the time allowed for each individual replayed Isabelle transition
-(e.g. a single `apply`, `by`, or `have` step). It is a **per-command** timeout,
-not a total timeout — so large theories with many fast commands are not
-penalized, but a single looping tactic is caught and named.
-
-When a command exceeds `-t`:
-
-- **`eval_at`** aborts and prints the offending line, e.g.:
-  ```
-  eval_at: timed out after 60s at line 42 (apply (induct n)).
-  ```
-  In injection mode the injected command and its line are reported.
-
-- **`desorry`** aborts immediately, prints the offending line, and writes
-  **nothing** — the input file is left unchanged and no `.backup` is created:
-  ```
-  desorry: timed out after 60s at line 17 (apply auto); no changes written.
-  ```
-
-To disable the timeout entirely (not recommended for agent use): `-t 0`.
-
-### Overall wall-clock safeguard
-
-Both tools also enforce an **overall wall-clock bound** that hard-terminates the
-spawned ML process group if a whole run runs too long (default **900 s / 15 min**).
-Unlike `-t`, this also catches hangs *outside* command evaluation — session-heap
-loading, GC/swap thrash — that would otherwise leave an **orphaned multi-GB
-`poly` process** behind after the controlling tool is gone.
-
-This is a machine-protection safeguard, **not** a per-call flag, and agents
-should not need to think about it. For the rare genuinely-huge heap (or for
-tests) it can be overridden via the environment variable
-`ISABELLE_CLI_TOOLS_WALL_TIMEOUT` (seconds; `0` disables):
-
-```bash
-ISABELLE_CLI_TOOLS_WALL_TIMEOUT=3600 isabelle eval_at Big.thy 200
-```
-
-### Live progress, heartbeats, and output streams
-
-Both tools print an immediate phase update while preparing the theory and
-checking the session heap, another when starting ML, and a replay update with
-the actual number of Isabelle transitions to process. Transition counts are
-not source-line counts.
-
-If 15 seconds pass without any visible result, warning, or phase update, the
-tool prints one heartbeat with its latest position. Further heartbeats remain
-limited to one per 15 seconds of silence:
-
-```text
-desorry: preparing theory and checking session heap...
-desorry: starting ML process...
-desorry: replaying 12,016 transitions...
-desorry: still working: replay 5,000/12,016 transitions (15s without output)
-```
-
-Internal position markers are consumed by the Scala runner and do not produce
-a line every few hundred transitions. Normal command and proof results go to
-stdout; progress, heartbeats, warnings, and fatal diagnostics go to stderr.
-This lets an agent poll a long-running command without either mistaking silence
-for a hang or receiving thousands of progress lines.
-
-Fatal replay, timeout, malformed-event, ML-process, and watchdog outcomes exit
-nonzero. Ordinary replay errors in `eval_at` state mode remain diagnostic:
-they are all reported on stderr, evaluation continues from the previous state,
-and the command exits successfully unless a fatal condition occurs.
-
 ### Prior commands and errors
 
 `eval_at` replays every Isabelle command from the top of the theory file down to
@@ -608,8 +428,8 @@ isabelle desorry [OPTIONS] THY_FILE [LINE]
 ```
 
 Finds all `sorry` proofs in `THY_FILE` (up to `LINE` if given), runs
-Sledgehammer on each in parallel, and overwrites the file in-place with
-found proofs substituted for the corresponding `sorry`s.
+Sledgehammer on each in parallel, and replaces the `sorry` commands for which
+it finds verified proofs. If no proof is found, the file is not modified.
 
 ### Options
 
@@ -620,23 +440,18 @@ found proofs substituted for the corresponding `sorry`s.
 | `-l NAME` | Override automatically derived logic session |
 | `-o OPT` | Override Isabelle system option |
 | `-t SECS` | Per-command timeout for replayed transitions (default: 60; 0 disables) |
-| `-v` | Verbose |
-
-Sledgehammer is requested with a fixed timeout of 50 seconds per `sorry` (not
-configurable). This is not a strict 50-second end-to-end wall deadline:
-individual prover slices and cleanup can run longer. The overall 900-second
-watchdog remains the hard bound for the complete ML process.
+| `-v` | Show the derived logic and verbose heap-check diagnostics |
 
 ### Examples
 
 ```bash
-# Replace all sorry's in a file
+# Replace all sorry commands in a file
 isabelle desorry Foo.thy
 
-# Only process sorry's up to line 100
+# Only process sorry commands up to line 100
 isabelle desorry Foo.thy 100
 
-# Only process sorry's at specific lines
+# Only process sorry commands at specific lines
 isabelle desorry -L 42,105 Foo.thy
 
 # Use a 120-second per-command timeout
@@ -655,30 +470,43 @@ isabelle desorry -l HOL-Analysis Foo.thy
    and the starting line of a parsed `sorry` transition. `desorry` aborts on
    the first ordinary replay error.
 2. **Phase 2 (parallel):** Runs Sledgehammer concurrently on all
-   collected proof states.
-3. **Commit:** ML writes a staged theory only inside its supervised temporary
-   directory. After the ML process exits cleanly, Scala creates the backup and
-   atomically replaces `THY_FILE`. Each processed `sorry` is replaced by the
-   Sledgehammer-found proof text (e.g. `by simp`, `by (metis foo bar)`),
-   preserving indentation. Sorry's for which no proof was found (or those
-   excluded by `-L`) are left unchanged.
+   collected proof states. A generated proof is accepted only when its
+   reconstruction successfully closes the captured goal.
+3. **Commit:** The replacement theory is staged separately. Only after proof
+   search exits cleanly does `desorry` create the backup and atomically replace
+   `THY_FILE`. Each processed `sorry` is replaced by the Sledgehammer-found
+   proof text (e.g. `by simp`, `by (metis foo bar)`), preserving indentation.
+   `sorry` commands for which no proof was found (or those excluded by `-L`)
+   are left unchanged.
+
+### Proof search
+
+Each selected `sorry` receives a separate Sledgehammer invocation with a fixed
+50-second scheduling budget. The value is not configurable. It stops new prover
+slices from starting after the budget has elapsed, but slices already running
+may finish later; it is therefore not a strict 50-second wall-clock deadline.
+The [overall watchdog](#overall-wall-clock-safeguard) remains the hard bound for
+the complete Isabelle/ML process.
 
 ### Backup mechanism
 
-Before modifying `THY_FILE`, desorry saves a copy to `THY_FILE.backup`.
-This provides a safety net if you want to revert:
+When at least one proof replacement is ready to commit, `desorry` saves the
+version of the theory read at invocation start to `THY_FILE.backup` and then
+atomically replaces `THY_FILE`. If no proof is found, neither file is changed.
+Do not edit the target while `desorry` is running: concurrent changes can be
+overwritten. The backup provides a safety net:
 
 ```bash
-# First run: Foo.thy.backup is created from the original Foo.thy
+# A successful replacement creates Foo.thy.backup from the original Foo.thy
 isabelle desorry Foo.thy
 
-# You review and accept the changes (edit Foo.thy, add new sorry's, etc.)
-# Second run: Foo.thy.backup is overwritten with your current Foo.thy
+# You review and accept the changes (edit Foo.thy, add new sorry commands, etc.)
+# A later successful replacement backs up the version read by that invocation
 isabelle desorry Foo.thy
 ```
 
-The backup always reflects the state of the file *before* the most recent
-desorry run. To revert, simply copy the backup back:
+The backup reflects the invocation-start snapshot used by the most recent
+successful replacement. To revert, copy it back:
 
 ```bash
 cp Foo.thy.backup Foo.thy
@@ -688,17 +516,128 @@ Replay, target-validation, timeout, and proof-search startup failures occur
 before the mutation branch: `desorry` exits nonzero, leaves the theory
 unchanged, and creates no backup.
 
-`desorry` validates the target theory and its imports, but it does **not**
-rebuild or validate sessions that reverse-depend on the edited theory. Run the
-appropriate session build separately when downstream compatibility is
-required.
+### Validation boundary
 
-### Technical note
+`desorry` loads the target theory's imports and replays the target itself. It
+does not discover or validate downstream theories that import the target. In
+other words, it validates the dependency direction needed to process the
+target, not the target's reverse-dependent session closure.
 
-Sledgehammer structures (defined in HOL) are not in the Poly/ML global
-namespace (Pure.thy sets `ML_write_global = false`). The tool handles
-this by evaluating the Sledgehammer code within the HOL theory context
-via `ML_Context.eval_file`.
+---
+
+## Sessions and Logic Selection
+
+Every Isabelle theory imports parent theories (`Main`, `Complex_Main`,
+`"HOL-Algebra.Ring"`, and so on). Those theories belong to sessions, Isabelle's
+compilation units defined in `ROOT` files. To process a target theory, the
+tools must start from a built session heap that contains the required imported
+theories.
+
+### Automatic logic derivation
+
+The tools inspect the target's imports and map known theory names to sessions:
+
+| Import in the theory | Derived session |
+|---|---|
+| `Pure` | `Pure` |
+| `Main` or `Complex_Main` | `HOL` |
+| `"HOL-Library.Multiset"` | `HOL-Library` |
+| `"HOL-Algebra.Ring"` | `HOL-Algebra` |
+| `"HOL-Analysis.Analysis"` | `HOL-Analysis` |
+
+For imports from multiple sessions, the tools choose the candidate with the
+deepest dependency ancestry. This is a convenience heuristic, not a
+replacement for explicit selection in custom projects. If derivation cannot
+identify a session, it falls back to Isabelle's default logic.
+
+### When to use `-l`
+
+Use `-l SESSION` to override automatic derivation when:
+
+- a custom or AFP theory uses unqualified import names;
+- automatic derivation selects the theory's unbuilt owning session;
+- you deliberately want to start from a particular built parent heap.
+
+```bash
+isabelle eval_at -l HOL-Algebra MyTheory.thy 10
+isabelle desorry -l HOL-Algebra MyTheory.thy
+```
+
+### When to use `-d`
+
+Use repeatable `-d DIR` options to add directories containing `ROOT` files.
+This is normally required for local sessions, AFP entries outside the standard
+search path, and bare-name sibling imports:
+
+```bash
+isabelle eval_at -l My_Parent -d /project/root MyTheory.thy 10
+isabelle eval_at -d /project/sessions -d /path/to/afp/thys/Foo MyTheory.thy 10
+```
+
+The tools also run Isabelle/ML from the target theory's directory, which lets
+ordinary sibling imports resolve without an additional working-directory
+option.
+
+### The selected heap must already be built
+
+The tools never build session heaps. They perform a no-build check and stop
+with an actionable error if the selected heap is unavailable or outdated:
+
+```text
+Session heap for "My_Session" is not available or not up to date;
+refusing to build it automatically.
+```
+
+Useful checks are:
+
+```bash
+# Resolve a session, including a local ROOT directory
+isabelle sessions -d /project/root My_Session
+
+# Check whether an up-to-date heap image exists without building it
+isabelle build -b -n -d /project/root My_Session
+
+# Show the heap location
+isabelle getenv ISABELLE_HEAPS
+```
+
+Heap files normally live below `$ISABELLE_HEAPS/polyml-*`. A file named
+`Foo_requirements(Bar)` is a requirements image created by commands such as
+`isabelle build -R Foo` or `isabelle jedit -R Foo`. It contains `Foo`'s
+ancestry, not the theories belonging to `Foo` itself.
+
+Building a required heap is an explicit setup operation:
+
+```bash
+isabelle build -b HOL
+```
+
+### Using a built parent for an unbuilt custom session
+
+Suppose a local `ROOT` contains:
+
+```isabelle
+session My_Session = "Parent_Session" +
+  theories
+    My_Theory
+```
+
+If `My_Session` itself is unbuilt but `Parent_Session` is built, start from the
+parent heap and provide the `ROOT` directory:
+
+```bash
+isabelle eval_at -l Parent_Session -d /project/root My_Theory.thy 15
+isabelle desorry -l Parent_Session -d /project/root My_Theory.thy
+```
+
+The tools then replay `My_Theory` and source imports on top of the built parent.
+Selecting the unbuilt owning session instead is refused rather than triggering
+a build:
+
+```bash
+isabelle eval_at -l My_Session -d /project/root My_Theory.thy 15
+# Session heap for "My_Session" is not available or not up to date.
+```
 
 ---
 
@@ -711,8 +650,9 @@ Run `isabelle scala_build` to rebuild, then retry.
 The target line has no Isabelle command and no proof state. Try a different
 line.
 
-**"eval_at: line N (...): failed (return code ...)"**
+**"ML process failed (return code ...)"**
 The ML process crashed. Add `-v` to see details. Common causes:
+
 - Missing imports — use `-d` to add the session directory
 - Wrong session — use `-l` to override
 
@@ -727,17 +667,19 @@ line, or choose an earlier LINE.
 **"Session heap for ... is not available or not up to date; refusing to build it automatically"**
 The chosen logic's heap is not built. The tools never build heaps. Either
 pick a session whose heap is already built (`-l`), or build the needed heap
-yourself first with `isabelle build -b SESSION [-d ROOT_DIR]`. See
-[Sessions](#sessions-how-the-tools-find-the-right-logic). Building HOL takes
-5-15 minutes; HOL-Analysis can take 30+ minutes — which is exactly why the
-tools leave that decision to you.
+yourself first with `isabelle build -b [-d ROOT_DIR] SESSION`. See
+[Sessions](#sessions-and-logic-selection). Build time depends strongly on the
+selected session and machine, which is why the tools leave that decision to
+you.
 
 **Sledgehammer finds nothing**
-`desorry` runs Sledgehammer at a fixed 50-second timeout per sorry (not
-configurable). For `eval_at`, try a longer timeout:
-`'sledgehammer [timeout = 60]'`. In both cases, try different provers
-(`'sledgehammer [provers = "vampire e cvc5"]'`), or simplify the goal
-with manual tactics first.
+`desorry` uses its fixed 50-second scheduling budget and default Sledgehammer
+portfolio. Use `eval_at` to experiment with a longer budget, selected provers,
+or manual simplification before editing the theory:
+
+```bash
+isabelle eval_at MyTheory.thy 42 'sledgehammer [timeout = 60, provers = "vampire e cvc5"]'
+```
 
 **Sibling imports not found**
 Use `-d DIR` to point at the directory containing the ROOT file that
@@ -748,7 +690,9 @@ defines the session.
 ## Known Limitations
 
 - **Startup cost:** Full theory elaboration from line 1 to LINE runs every
-  invocation. Deep lines in large files can be slow.
+  `eval_at` invocation. `desorry` replays through its optional stop line, or
+  through the complete theory when no stop line is given. Large files can be
+  slow.
 - **Bare-name imports** from non-sibling directories are not auto-detected.
   Use `-d DIR` to point at the directory containing the ROOT file.
 - **Transitive path-based imports** inside sibling theories are not
@@ -758,3 +702,10 @@ defines the session.
   counts as the "position" for that command.
 - **External provers** (for `sledgehammer`, `nitpick`) must be available in
   the Isabelle contrib directory. Standard Isabelle distributions include them.
+- **`desorry` proof-search memory:** `desorry` retains every selected proof
+  state until its parallel proof-search phase finishes; it does not batch goals
+  according to available memory. Use `-L` to select fewer goals, or the
+  positional stop line to limit both replay and collection.
+- **No reverse-dependent validation:** `desorry` does not inspect theories that
+  import its target; it validates only the target and the imports needed to
+  process it.

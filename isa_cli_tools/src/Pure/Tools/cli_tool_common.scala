@@ -134,7 +134,7 @@ fun cli_tool_with_local_protocol_handlers f x =
           "  1. Choose a session whose heap is already built.\n" +
           "  2. If the theory belongs to an unbuilt session, use that session's built parent " +
           "with -l and pass -d for the directory containing the ROOT file.\n" +
-          "  3. Check first with: isabelle build -n SESSION [-d ROOT_DIR]\n\n" +
+          "  3. Check first with: isabelle build -b -n [-d ROOT_DIR] SESSION\n\n" +
           example)
     }
   }
