@@ -1,8 +1,7 @@
 # Isabelle agentic CLI tools
 
 Command-line tools that expose Isabelle functionality for agentic and other
-non-PIDE workflows. The current tools are `eval_at` and `desorry`. Earlier
-command-specific experiments are retained under `legacy/`.
+non-PIDE workflows. The current tools are `eval_at` and `desorry`.
 
 ## Isabelle compatibility
 
