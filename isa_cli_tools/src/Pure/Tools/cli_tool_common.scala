@@ -461,7 +461,7 @@ end;
           case Some(s) if s.nonEmpty => Value.Int.parse(s)
           case _ => 900
         }
-      val server = Bash.Server.start(Logger.none)
+      val server = Bash.Server.start()
       var watchdog: Option[Future[Unit]] = None
       var process: Option[Bash.Process] = None
       var process_joined = false
@@ -485,8 +485,9 @@ end;
           Sessions.background(
             qd_options, prepared.logic, dirs = prepared.dirs).check_errors
         val session_heaps =
-          store.session_heaps(session_background, logic = prepared.logic)
-        val (_, ml_process) =
+          ML_Process.session_heaps(
+            store, session_background, logic = prepared.logic)
+        val ml_process =
           ML_Process(
             qd_options,
             session_background,

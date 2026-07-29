@@ -75,12 +75,13 @@ let
     if l >= 1 andalso l <= length file_lines
     then List.nth (file_lines, l - 1) else "";
 
-  val master_dir = Path.dir (Path.absolute thy_file);
+  val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
+  val options = Options.default ();
   val _ = cli_tool_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
-      else (Thy_Info.use_theories "" [((imp, Position.none), [])]; ())
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
     ) (#imports header)) ();
 
   val init = fn () =>
@@ -130,7 +131,7 @@ let
       val res =
         Exn.result (fn () =>
           Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-            (fn () => Toplevel.command_exception tr st) ()) ();
+            (fn () => Toplevel.command_exception true tr st) ()) ();
       val t = Timing.result start;
       val _ = if do_timing andalso not (Toplevel.is_ignored tr) then
                 let
@@ -267,12 +268,13 @@ let
     then List.nth (file_lines, inject_line - 1)
     else "";
 
-  val master_dir = Path.dir (Path.absolute thy_file);
+  val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
+  val options = Options.default ();
   val _ = cli_tool_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
-      else (Thy_Info.use_theories "" [((imp, Position.none), [])]; ())
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
     ) (#imports header)) ();
 
   val init = fn () =>
@@ -320,7 +322,7 @@ let
       val start = Timing.start ();
       val res =
         (Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-           (fn () => Toplevel.command_exception tr st) ()
+           (fn () => Toplevel.command_exception true tr st) ()
          handle Timeout.TIMEOUT _ =>
            let val l = (case Position.line_of (Toplevel.pos_of tr) of SOME l => l | NONE => 0)
            in

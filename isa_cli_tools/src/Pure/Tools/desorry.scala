@@ -246,13 +246,14 @@ let
     if line >= 1 andalso line <= length file_lines
     then List.nth (file_lines, line - 1) else "";
 
-  val master_dir = Path.dir (Path.absolute thy_file);
+  val master_dir = Path.dir (File.absolute_path thy_file);
   val header = Thy_Header.read Position.none original;
+  val options = Options.default ();
 
   val _ = cli_tool_with_local_protocol_handlers (fn () =>
     List.app (fn (imp, _) =>
       if Thy_Info.defined_theory imp then ()
-      else (Thy_Info.use_theories "" [((imp, Position.none), [])]; ())
+      else (Thy_Info.use_theories options "" [(imp, Position.none)]; ())
     ) (#imports header)) ();
 
   fun mk_thy () =
@@ -325,7 +326,7 @@ let
             (fn () => Unsynchronized.setmp Private_Output.legacy_fn capture_warn
               (fn () => Exn.result (fn () =>
                 Timeout.apply (Time.fromMilliseconds (1000 * cmd_timeout))
-                  (fn () => Toplevel.command_exception tr st) ()) ()) ()) ()) ();
+                  (fn () => Toplevel.command_exception true tr st) ()) ()) ()) ()) ();
       val _ = List.app (fn msg =>
         CLI_Tool_Event.warning
           ("Warning at line " ^ Int.toString line ^
