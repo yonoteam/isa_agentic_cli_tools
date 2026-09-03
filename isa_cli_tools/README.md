@@ -27,40 +27,53 @@ built**; the tools verify this before starting Isabelle/ML work (see
 
 ## Recommended Workflow: sorry Skeletons
 
-**Keep the theory loadable at every step.** A theory whose unfinished leaves are all
-`sorry` still loads, which is what makes these tools fast: `eval_at` state mode reports
-*every* error in one pass, and `desorry` attacks *every* open leaf in parallel from one
-heap load. A theory containing one half-written proof loads up to the break and tells
-you nothing past it.
+**Keep the theory loadable at every step, and never learn from a build what a file-level
+command could have told you.** A theory whose unfinished leaves are all `sorry` still
+loads, which is what makes these tools fast: `eval_at` state mode reports *every* error
+in one pass, and `desorry` attacks *every* open leaf in parallel from one heap load. A
+theory containing one half-written proof loads up to the break and tells you nothing
+past it.
 
-Do not write proofs and then check them. Write structure, keep it loading, and let the
-tools fill in the leaves:
+**Preflight once.** `isabelle build -b -n -d . SESSION`. The tools never build heaps; if
+the theory's own session is unbuilt, pass a built *parent* to `-l` and the project root
+to `-d`. A theory with several parent sessions still needs only one `-l` — pick the
+deepest already-built parent and let the rest load from source through `-d`. Do not
+build a new session to cover the union of the parents. See
+[Session Preflight](#for-ai-agents-session-preflight).
 
-1. **Preflight the session once** — `isabelle build -b -n -d . SESSION`. Fix `-l PARENT
-   -d .` here and reuse it for every later command. See
-   [Session Preflight](#for-ai-agents-session-preflight).
-2. **Replace the obligation with a skeleton** — the Isar structure you believe the proof
-   has (induction, case split, intermediate `have`s), every branch terminated by `sorry`.
-   Close nothing yet.
-3. **Validate the skeleton in one pass** — `isabelle eval_at -l PARENT -d . T.thy $(wc -l
-   < T.thy)`. State mode reports every error and recovers after each, so one run surfaces
-   all structural problems. Repeat until clean.
-4. **Let `desorry` close the leaves** — `isabelle desorry -l PARENT -d . T.thy`. One
-   replay, then Sledgehammer on all leaves in parallel; only verified proofs are written.
-5. **Work the survivors** — `grep -n sorry T.thy`, then `eval_at` at those lines to see
-   the goal, try methods with `-s`, or `find_theorems`. A survivor usually means the leaf
-   is too big a step: split it into a finer skeleton and return to step 3.
-6. **Build only as the final gate** — `grep` for leftover `sorry`, `rm -f *.thy.backup`,
-   then `isabelle build -d . -o quick_and_dirty=false SESSION`. A session build costs
-   minutes to tens of minutes; it is the acceptance check, not the feedback loop.
+**Then pick a mode by the size of the gap.** If the surrounding development already
+gives you a plausible one-line proof, write it and validate with `eval_at`. If the
+direct attempt fails, or the statement needs an induction or case analysis you cannot
+close in one step, use the skeleton loop:
+
+1. **Skeleton** — replace the obligation with the Isar structure you believe the proof
+   has (induction, case split, intermediate `have`s), every branch terminated by
+   `sorry`. Close nothing yet.
+2. **Validate in one pass** — `isabelle eval_at -l PARENT -d . T.thy $(wc -l < T.thy)`.
+   State mode reports every error and recovers after each, so one run surfaces all
+   structural problems. Repeat until clean.
+3. **`desorry` the leaves** — `isabelle desorry -l PARENT -d . T.thy`. One replay, then
+   Sledgehammer on every leaf in parallel; only verified proofs are written back. This is
+   where the skeleton pays: `desorry` on a whole unbroken obligation is one call against
+   one large goal and usually finds nothing, while a ten-leaf skeleton is ten calls
+   against ten small goals for the price of one replay.
+4. **Work the survivors** — `grep -n sorry T.thy`, then `eval_at` at those lines to see
+   the goal, try methods with `-s`, or `find_theorems`. A survivor means that leaf is
+   still too big a step: split it into finer `have`s and return to step 2.
+5. **Gate** — `grep` for leftover `sorry`, `rm -f *.thy.backup`, then `isabelle build -d
+   . -o quick_and_dirty=false SESSION`.
+
+In both modes, `isabelle build` is the final acceptance gate, never the iteration loop:
+a session build costs minutes to tens of minutes, while file-level `eval_at` costs
+seconds to a minute and tells you the same thing about your file.
 
 Two traps worth knowing before you start: `sorry` is accepted under `quick_and_dirty` but
 changes the logical context, so a proof found above a remaining `sorry` can fail once
-that `sorry` is replaced — re-run step 3 after every `desorry` pass. And `desorry` writes
+that `sorry` is replaced — re-run step 2 after every `desorry` pass. And `desorry` writes
 `T.thy.backup` beside the theory on every successful commit, which is a new file in the
 project; delete backups before any final build or "only these files changed" check.
 
-The full version of this workflow, with a worked example and a mistakes table, is in
+The full version, with a worked example and a mistakes table, is in
 [`skills/proving-with-sorry-skeletons/SKILL.md`](../skills/proving-with-sorry-skeletons/SKILL.md).
 
 ---
