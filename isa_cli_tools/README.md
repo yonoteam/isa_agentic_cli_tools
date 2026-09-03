@@ -27,6 +27,11 @@ built**; the tools verify this before starting Isabelle/ML work (see
 
 ## Recommended Workflow: sorry Skeletons
 
+> **Read [`skills/proving-with-sorry-skeletons/SKILL.md`](../skills/proving-with-sorry-skeletons/SKILL.md)
+> before your first tool invocation.** This section states the loop; the skill adds the
+> worked skeleton, the survivor-refinement step, and a mistakes table. Skipping it is how
+> agents end up hand-writing a long proof and waiting on session builds to check it.
+
 **Keep the theory loadable at every step, and never learn from a build what a file-level
 command could have told you.** A theory whose unfinished leaves are all `sorry` still
 loads, which is what makes these tools fast: `eval_at` state mode reports *every* error
@@ -77,7 +82,7 @@ that `sorry` is replaced — re-run step 2 after every `desorry` pass. And `deso
 `T.thy.backup` beside the theory on every successful commit, which is a new file in the
 project; delete backups before any final build or "only these files changed" check.
 
-The full version, with a worked example and a mistakes table, is in
+Worked example, survivor refinement, and the full mistakes table:
 [`skills/proving-with-sorry-skeletons/SKILL.md`](../skills/proving-with-sorry-skeletons/SKILL.md).
 
 ---

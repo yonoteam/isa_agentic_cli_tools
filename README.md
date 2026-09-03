@@ -28,10 +28,12 @@ terminating every branch in `sorry`; validate the whole file in one `eval_at` pa
 `desorry` close the leaves in parallel; refine the skeleton for whatever survives. In
 either case `isabelle build` is the final acceptance check, never the iteration loop.
 
-Read this before using either tool:
-[`skills/proving-with-sorry-skeletons/SKILL.md`](skills/proving-with-sorry-skeletons/SKILL.md),
-or the condensed version in the
-[isa_cli_tools guide](isa_cli_tools/README.md#recommended-workflow-sorry-skeletons).
+**Read [`skills/proving-with-sorry-skeletons/SKILL.md`](skills/proving-with-sorry-skeletons/SKILL.md)
+before your first tool invocation.** It is short, and it carries the worked skeleton, the
+session-preflight rules, and the mistakes that cost the most time here — chiefly using
+`isabelle build` as a feedback loop, and hand-writing a long proof that a skeleton plus
+`desorry` would have closed in parallel. The summary above is orientation, not a
+substitute for it.
 
 This repository originated as a proof of concept for spec-driven
 autoformalization workflows such as
