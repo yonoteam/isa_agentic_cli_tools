@@ -21,11 +21,11 @@ session selection, usage, and troubleshooting.
 
 ## Recommended workflow
 
-These tools are built around a **sorry-skeleton loop**: replace a proof obligation with
-the Isar structure you believe the proof has, terminating every branch in `sorry`;
-validate the whole file in one `eval_at` pass; let `desorry` close the leaves in
-parallel; refine the skeleton for whatever survives; and run `isabelle build` only as
-the final acceptance check, never as the iteration loop.
+These tools are built around a **sorry-skeleton loop**. When an obligation does not fall
+to a direct one-line proof, replace it with the Isar structure you believe the proof has,
+terminating every branch in `sorry`; validate the whole file in one `eval_at` pass; let
+`desorry` close the leaves in parallel; refine the skeleton for whatever survives. In
+either case `isabelle build` is the final acceptance check, never the iteration loop.
 
 Read this before using either tool:
 [`skills/proving-with-sorry-skeletons/SKILL.md`](skills/proving-with-sorry-skeletons/SKILL.md),
