@@ -22,7 +22,8 @@ session selection, usage, and troubleshooting.
 ## Recommended workflow
 
 These tools are built around a **sorry-skeleton loop**. When an obligation does not fall
-to a direct one-line proof, replace it with the Isar structure you believe the proof has,
+to a short direct proof — or when the proof you are about to write runs past ten lines —
+replace it with the Isar structure you believe the proof has,
 terminating every branch in `sorry`; validate the whole file in one `eval_at` pass; let
 `desorry` close the leaves in parallel; refine the skeleton for whatever survives. In
 either case `isabelle build` is the final acceptance check, never the iteration loop.

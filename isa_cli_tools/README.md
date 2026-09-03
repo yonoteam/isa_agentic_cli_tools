@@ -37,14 +37,18 @@ past it.
 **Preflight once.** `isabelle build -b -n -d . SESSION`. The tools never build heaps; if
 the theory's own session is unbuilt, pass a built *parent* to `-l` and the project root
 to `-d`. A theory with several parent sessions still needs only one `-l` — pick the
-deepest already-built parent and let the rest load from source through `-d`. Do not
-build a new session to cover the union of the parents. See
-[Session Preflight](#for-ai-agents-session-preflight).
+deepest already-built parent and let the rest load from source through `-d`. Building a
+scratch session to cover the union of the parents costs minutes up front and pays only
+if source reloading really dominates your `eval_at` passes, so run one pass and time it
+before deciding. See [Session Preflight](#for-ai-agents-session-preflight).
 
-**Then pick a mode by the size of the gap.** If the surrounding development already
-gives you a plausible one-line proof, write it and validate with `eval_at`. If the
-direct attempt fails, or the statement needs an induction or case analysis you cannot
-close in one step, use the skeleton loop:
+**Then pick a mode by the size of the gap.** If the surrounding development gives you a
+plausible proof of a few lines, write it and validate with `eval_at`. Use the skeleton
+loop when the proof you are about to write is longer than about ten lines, when a direct
+attempt fails, or when the statement needs an induction or case analysis you cannot close
+in one step. The skeleton is the outline you were going to write anyway — terminating its
+branches with `sorry` costs nothing and buys a structural check plus a parallel
+Sledgehammer attempt on every leaf:
 
 1. **Skeleton** — replace the obligation with the Isar structure you believe the proof
    has (induction, case split, intermediate `have`s), every branch terminated by
